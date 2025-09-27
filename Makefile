@@ -44,12 +44,8 @@ WINDOWS_TARGETS := \
 	windows-i386 \
 	windows-arm64
 
-# WebAssembly targets
-WASM_TARGETS := \
-	wasm32-wasi
-
 # All targets
-ALL_TARGETS := $(LINUX_TARGETS) $(MACOS_TARGETS) $(WINDOWS_TARGETS) $(WASM_TARGETS)
+ALL_TARGETS := $(LINUX_TARGETS) $(MACOS_TARGETS) $(WINDOWS_TARGETS)
 
 # Cross-compiler configurations
 # =================================================================
@@ -76,24 +72,18 @@ CC_windows-x86_64 := x86_64-w64-mingw32-gcc
 CC_windows-i386 := i686-w64-mingw32-gcc
 CC_windows-arm64 := clang --target=aarch64-pc-windows-msvc
 
-# WebAssembly cross-compilers (clang + WASI)
-CC_wasm32-wasi := clang
-
 # Architecture-specific CFLAGS
 CFLAGS_linux-i386 := -m32
 CFLAGS_linux-armv7 := -march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard
-CFLAGS_wasm32-wasi := --target=wasm32-wasi --sysroot=/usr -I/usr/include/wasm32-wasi
 
 # OS-specific LDFLAGS
 LDFLAGS_windows := -static -lpthread -lws2_32
 LDFLAGS_darwin := -lpthread
-LDFLAGS_wasm := -lwasi-emulated-mman -lwasi-emulated-signal -lwasi-emulated-process-clocks
 
 # File extensions by OS
 EXT_linux :=
 EXT_darwin :=
 EXT_windows := .exe
-EXT_wasm := .wasm
 
 # Build rules
 # =================================================================
@@ -101,7 +91,7 @@ EXT_wasm := .wasm
 .PHONY: all clean distclean help install check-deps
 .PHONY: $(ALL_TARGETS) native
 .PHONY: dist release checksums package
-.PHONY: linux macos windows wasm
+.PHONY: linux macos windows
 
 # Default target - build for current platform
 all: native
@@ -117,7 +107,6 @@ native:
 linux: $(LINUX_TARGETS)
 macos: $(MACOS_TARGETS)
 windows: $(WINDOWS_TARGETS)
-wasm: $(WASM_TARGETS)
 
 # Individual target builds
 $(LINUX_TARGETS): linux-%:
@@ -149,20 +138,6 @@ $(WINDOWS_TARGETS): windows-%:
 	elif command -v $(CC_$@) >/dev/null 2>&1; then \
 		$(CC_$@) $(CFLAGS) $(CFLAGS_$@) -o $(BUILD_DIR)/$(PROJECT)-$@$(EXT_windows) $(SRC_FILE) $(LDFLAGS_windows) && \
 		echo "✓ Built $@: $(BUILD_DIR)/$(PROJECT)-$@$(EXT_windows)"; \
-	else \
-		echo "✗ Skipping $@: $(CC_$@) not found"; \
-	fi
-
-$(WASM_TARGETS): wasm32-%:
-	@echo "Building $@ ($(CC_$@))..."
-	@mkdir -p $(BUILD_DIR)
-	@if command -v $(CC_$@) >/dev/null 2>&1; then \
-		if [ -d "/usr/share/wasm32-wasi" ]; then \
-			$(CC_$@) $(CFLAGS) $(CFLAGS_$@) -o $(BUILD_DIR)/$(PROJECT)-$@$(EXT_wasm) $(SRC_FILE) $(LDFLAGS_wasm) && \
-			echo "✓ Built $@: $(BUILD_DIR)/$(PROJECT)-$@$(EXT_wasm)"; \
-		else \
-			echo "✗ Skipping $@: WASI sysroot not found (install wasi-libc)"; \
-		fi; \
 	else \
 		echo "✗ Skipping $@: $(CC_$@) not found"; \
 	fi
@@ -252,8 +227,6 @@ check-deps:
 	@command -v $(CC_windows-x86_64) >/dev/null 2>&1 && echo "  ✓ windows-x86_64: $(CC_windows-x86_64)" || echo "  ✗ windows-x86_64: $(CC_windows-x86_64) (not found)"
 	@command -v $(CC_windows-i386) >/dev/null 2>&1 && echo "  ✓ windows-i386: $(CC_windows-i386)" || echo "  ✗ windows-i386: $(CC_windows-i386) (not found)"
 	@command -v clang >/dev/null 2>&1 && echo "  ✓ windows-arm64: clang (with Windows ARM64 target)" || echo "  ✗ windows-arm64: clang (not found)"
-	@command -v $(CC_wasm32-wasi) >/dev/null 2>&1 && echo "  ✓ wasm32-wasi: $(CC_wasm32-wasi)" || echo "  ✗ wasm32-wasi: $(CC_wasm32-wasi) (not found)"
-	@[ -d "/usr/include/wasm32-wasi" ] && echo "  ✓ WASI sysroot: /usr/include/wasm32-wasi" || echo "  ✗ WASI sysroot: /usr/include/wasm32-wasi (install wasi-libc)"
 
 # Install native binary
 install: native
@@ -287,7 +260,6 @@ info:
 	@echo "  Linux: $(LINUX_TARGETS)"
 	@echo "  macOS: $(MACOS_TARGETS)"
 	@echo "  Windows: $(WINDOWS_TARGETS)"
-	@echo "  WebAssembly: $(WASM_TARGETS)"
 
 # Help
 help:
@@ -300,13 +272,11 @@ help:
 	@echo "  linux          - Build all Linux targets"
 	@echo "  macos          - Build all macOS targets"
 	@echo "  windows        - Build all Windows targets"
-	@echo "  wasm           - Build all WebAssembly targets"
 	@echo ""
 	@echo "Individual targets:"
 	@echo "  $(LINUX_TARGETS)"
 	@echo "  $(MACOS_TARGETS)"
 	@echo "  $(WINDOWS_TARGETS)"
-	@echo "  $(WASM_TARGETS)"
 	@echo ""
 	@echo "Distribution:"
 	@echo "  dist           - Create distribution with all binaries"
