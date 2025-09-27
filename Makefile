@@ -44,6 +44,9 @@ WINDOWS_TARGETS := \
 	windows-i386 \
 	windows-arm64
 
+# Note: windows-arm64 requires Windows SDK and is not supported with MinGW cross-compilation
+# windows-arm64
+
 # All targets
 ALL_TARGETS := $(LINUX_TARGETS) $(MACOS_TARGETS) $(WINDOWS_TARGETS)
 

@@ -14,29 +14,69 @@
  * Usage: ./usbctl [options]
  */
 
-// Enable POSIX/GNU extensions for readlink and others before any headers
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
+// Platform detection
+#ifdef _WIN32
+    #define PLATFORM_WINDOWS
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #include <io.h>
+    #include <direct.h>
+    #ifdef _MSC_VER
+        #pragma comment(lib, "ws2_32.lib")
+        #pragma comment(lib, "pthread")
+    #endif
+    // Windows socket compatibility
+    #define close(s) closesocket(s)
+    #define ssize_t int
+    #define sleep(x) Sleep(x * 1000)
+    #define popen(cmd, mode) _popen(cmd, mode)
+    #define pclose(fp) _pclose(fp)
+    #define mkdir(path, mode) _mkdir(path)
+    #define PATH_SEPARATOR "\\"
+    // Windows-specific missing definitions
+    #define MSG_NOSIGNAL 0
+    #define SIGPIPE 13
+    #define WEXITSTATUS(w) (((w) >> 8) & 0xff)
+    // Signal handling compatibility
+    struct sigaction {
+        void (*sa_handler)(int);
+        int sa_flags;
+        int sa_mask;
+    };
+    #define sigemptyset(set) (*(set) = 0)
+    #define sigaction(sig, act, oact) signal(sig, (act)->sa_handler)
+#else
+    #define PLATFORM_UNIX
+    // Enable POSIX/GNU extensions for readlink and others before any headers
+    #ifndef _GNU_SOURCE
+    #define _GNU_SOURCE
+    #endif
+    #include <unistd.h>
+    #include <sys/time.h>
+    #include <sys/select.h>
+    #include <sys/wait.h>
+    #include <sys/socket.h>
+    #include <sys/stat.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <dirent.h>
+    #define PATH_SEPARATOR "/"
 #endif
 
+// Common headers
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <errno.h>
 #include <time.h>
-#include <dirent.h>
 #include <fcntl.h>
 #include <stdarg.h>
-#include <sys/time.h>
-#include <sys/select.h>
-#include <sys/wait.h>
 
 #define VERSION "1.0.0"
 #define AUTHOR "github.com/suifei"
@@ -57,7 +97,17 @@ typedef struct
     char config_path[CONFIG_PATH_SIZE];
     int verbose_logging;
     char log_file[256];
+    char bound_devices[MAX_DEVICES][16]; // Array to store bound device busids
+    int bound_devices_count;
 } config_t;
+
+// Function declarations (forward declarations)
+void update_bound_devices_config();
+void restore_bound_devices();
+int bind_device(const char *busid);
+int unbind_device(const char *busid);
+int exec_command(const char *cmd, char *output, size_t output_size);
+
 // HTTP响应函数声明
 void send_http_response(int client_socket, int status_code, const char *status_text, const char *content_type, const char *body);
 
@@ -79,7 +129,7 @@ typedef struct
 } client_t;
 
 // Global variables
-static config_t g_config = {DEFAULT_PORT, DEFAULT_BIND, 3, "", 1, "/var/log/usbctl.log"};
+static config_t g_config = {DEFAULT_PORT, DEFAULT_BIND, 3, "", 1, "/var/log/usbctl.log", {""}, 0};
 static usb_device_t g_devices[MAX_DEVICES];
 static int g_device_count = 0;
 static client_t g_clients[MAX_CLIENTS];
@@ -363,6 +413,77 @@ void log_message(const char *level, const char *format, ...)
     fflush(g_log_file);
 }
 
+// ============================================================================
+// PLATFORM-SPECIFIC COMPATIBILITY FUNCTIONS
+// ============================================================================
+
+#ifdef PLATFORM_WINDOWS
+// Initialize Windows networking
+int init_windows_networking()
+{
+    WSADATA wsaData;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0)
+    {
+        log_message("ERROR", "WSAStartup failed: %d", result);
+        return 0;
+    }
+    log_message("DEBUG", "Windows networking initialized");
+    return 1;
+}
+
+// Cleanup Windows networking
+void cleanup_windows_networking()
+{
+    WSACleanup();
+    log_message("DEBUG", "Windows networking cleaned up");
+}
+
+// Windows-compatible mkdir function (already defined as macro)
+// int mkdir_windows(const char *path) { return _mkdir(path); }
+
+// Windows-compatible readdir functionality
+// Note: For full Windows USB device enumeration, we would need to use
+// Windows-specific APIs like SetupAPI or WMI, which is beyond the scope
+// of a simple usbip wrapper. This would require significant additional code.
+
+#else // Unix/Linux platforms
+
+// Initialize Unix networking (no-op, but for consistency)
+int init_unix_networking()
+{
+    log_message("DEBUG", "Unix networking ready (no initialization required)");
+    return 1;
+}
+
+// Cleanup Unix networking (no-op)
+void cleanup_unix_networking()
+{
+    log_message("DEBUG", "Unix networking cleanup (no cleanup required)");
+}
+
+#endif
+
+// Cross-platform networking initialization
+int init_platform_networking()
+{
+#ifdef PLATFORM_WINDOWS
+    return init_windows_networking();
+#else
+    return init_unix_networking();
+#endif
+}
+
+// Cross-platform networking cleanup
+void cleanup_platform_networking()
+{
+#ifdef PLATFORM_WINDOWS
+    cleanup_windows_networking();
+#else
+    cleanup_unix_networking();
+#endif
+}
+
 // Check system compatibility
 int check_system_compatibility()
 {
@@ -419,6 +540,26 @@ int check_system_compatibility()
 
 #elif _WIN32
     log_message("INFO", "Windows support requires usbipd-win or usbip-win");
+    
+    // Check for usbipd-win installation
+    char output[512];
+    if (exec_command("usbipd --version", output, sizeof(output)) == 0)
+    {
+        log_message("INFO", "Found usbipd-win: %s", output);
+    }
+    else if (exec_command("usbip version", output, sizeof(output)) == 0)
+    {
+        log_message("INFO", "Found usbip: %s", output);
+    }
+    else
+    {
+        log_message("WARN", "usbipd-win not found. Install from: https://github.com/dorssel/usbipd-win");
+        log_message("INFO", "Alternative: Install usbip-win or use WSL with Linux usbip tools");
+    }
+    
+    // Check if running as Administrator (optional for web interface)
+    // Note: Checking admin privileges on Windows requires additional APIs
+    log_message("INFO", "For full functionality, run as Administrator");
 
 #else
     log_message("WARN", "Untested platform. Web interface functionality available");
@@ -461,15 +602,36 @@ char *get_local_ip()
 // Get home directory path
 const char *get_home_dir()
 {
+#ifdef PLATFORM_WINDOWS
+    const char *home = getenv("USERPROFILE");
+    if (!home) {
+        home = getenv("HOMEDRIVE");
+        if (home) {
+            const char *homepath = getenv("HOMEPATH");
+            if (homepath) {
+                static char win_home[512];
+                snprintf(win_home, sizeof(win_home), "%s%s", home, homepath);
+                return win_home;
+            }
+        }
+    }
+    return home ? home : "C:\\temp";
+#else
     const char *home = getenv("HOME");
     return home ? home : "/tmp";
+#endif
 }
 
 // Initialize default configuration
 void init_config()
 {
+#ifdef PLATFORM_WINDOWS
+    snprintf(g_config.config_path, sizeof(g_config.config_path),
+             "%s\\AppData\\Local\\usbctl\\config", get_home_dir());
+#else
     snprintf(g_config.config_path, sizeof(g_config.config_path),
              "%s/.config/usbctl/config", get_home_dir());
+#endif
 }
 
 // Create directory recursively
@@ -481,6 +643,27 @@ int mkdirs(const char *path)
 
     snprintf(tmp, sizeof(tmp), "%s", path);
     len = strlen(tmp);
+    
+#ifdef PLATFORM_WINDOWS
+    // Handle Windows path separators
+    if (tmp[len - 1] == '\\' || tmp[len - 1] == '/')
+    {
+        tmp[len - 1] = 0;
+    }
+
+    for (p = tmp + 1; *p; p++)
+    {
+        if (*p == '\\' || *p == '/')
+        {
+            char sep = *p;
+            *p = 0;
+            mkdir(tmp, 0755);  // Windows _mkdir macro doesn't use mode parameter
+            *p = sep;
+        }
+    }
+    return mkdir(tmp, 0755);
+#else
+    // Unix/Linux path separators
     if (tmp[len - 1] == '/')
     {
         tmp[len - 1] = 0;
@@ -496,6 +679,7 @@ int mkdirs(const char *path)
         }
     }
     return mkdir(tmp, 0755);
+#endif
 }
 
 // Load configuration from file
@@ -506,8 +690,13 @@ int load_config()
         return 0;
 
     char line[256];
+    g_config.bound_devices_count = 0; // Reset bound devices count
+    
     while (fgets(line, sizeof(line), fp))
     {
+        // Remove trailing newline
+        line[strcspn(line, "\n")] = '\0';
+        
         if (strncmp(line, "port=", 5) == 0)
         {
             g_config.port = atoi(line + 5);
@@ -528,8 +717,17 @@ int load_config()
         {
             sscanf(line + 9, "%255s", g_config.log_file);
         }
+        else if (strncmp(line, "bound_device=", 13) == 0 && g_config.bound_devices_count < MAX_DEVICES)
+        {
+            // Load bound device busid
+            sscanf(line + 13, "%15s", g_config.bound_devices[g_config.bound_devices_count]);
+            g_config.bound_devices_count++;
+            log_message("DEBUG", "Loaded bound device from config: %s", line + 13);
+        }
     }
     fclose(fp);
+    
+    log_message("INFO", "Configuration loaded: %d bound devices found", g_config.bound_devices_count);
     return 1;
 }
 
@@ -553,13 +751,82 @@ int save_config()
     fprintf(fp, "port=%d\n", g_config.port);
     fprintf(fp, "bind=%s\n", g_config.bind_address);
     fprintf(fp, "poll_interval=%d\n", g_config.poll_interval);
+    
+    // Save currently bound devices
+    update_bound_devices_config();
+    for (int i = 0; i < g_config.bound_devices_count; i++)
+    {
+        if (strlen(g_config.bound_devices[i]) > 0)
+        {
+            fprintf(fp, "bound_device=%s\n", g_config.bound_devices[i]);
+        }
+    }
+    
     fclose(fp);
+    log_message("INFO", "Configuration saved with %d bound devices", g_config.bound_devices_count);
     return 1;
 }
 
 // ============================================================================
 // USB/IP BACKEND FUNCTIONS
 // ============================================================================
+
+// Update bound devices configuration based on current device states
+void update_bound_devices_config()
+{
+    g_config.bound_devices_count = 0;
+    for (int i = 0; i < g_device_count; i++)
+    {
+        if (g_devices[i].bound && g_config.bound_devices_count < MAX_DEVICES)
+        {
+            // Use snprintf for safer string copying, limit to busid size
+            int len = snprintf(g_config.bound_devices[g_config.bound_devices_count], 
+                    sizeof(g_config.bound_devices[0]), "%.*s", 
+                    (int)sizeof(g_devices[i].busid)-1, g_devices[i].busid);
+            if (len > 0 && len < (int)sizeof(g_config.bound_devices[0])) {
+                g_config.bound_devices_count++;
+            }
+        }
+    }
+}
+
+// Restore bound devices from configuration (for system restart recovery)
+void restore_bound_devices()
+{
+    log_message("INFO", "Restoring bound devices from configuration...");
+    
+    for (int i = 0; i < g_config.bound_devices_count; i++)
+    {
+        if (strlen(g_config.bound_devices[i]) > 0)
+        {
+            log_message("INFO", "Restoring bind for device: %s", g_config.bound_devices[i]);
+            if (bind_device(g_config.bound_devices[i]))
+            {
+                log_message("INFO", "Successfully restored bind for device: %s", g_config.bound_devices[i]);
+            }
+            else
+            {
+                log_message("WARNING", "Failed to restore bind for device: %s (device may not be available)", 
+                           g_config.bound_devices[i]);
+            }
+        }
+    }
+    
+    log_message("INFO", "Bound device restoration completed");
+}
+
+// Check if a device should be bound based on configuration
+int is_device_configured_as_bound(const char *busid)
+{
+    for (int i = 0; i < g_config.bound_devices_count; i++)
+    {
+        if (strcmp(g_config.bound_devices[i], busid) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 // Execute command and capture output
 int exec_command(const char *cmd, char *output, size_t output_size)
@@ -612,13 +879,22 @@ int list_usbip_devices()
 {
     char output[4096];
 
-    // Try different usbip command variations for compatibility
+    // Platform-specific usbip command variations for compatibility
+#ifdef PLATFORM_WINDOWS
+    const char *usbip_commands[] = {
+        "usbipd wsl list",                    // usbipd-win for WSL
+        "usbip list -l",                      // Standard command (if available)
+        "wsl usbip list -l",                  // Via WSL
+        "C:\\Program Files\\usbipd-win\\usbipd.exe wsl list", // Full path usbipd-win
+        NULL};
+#else
     const char *usbip_commands[] = {
         "usbip list -l",           // Standard command
         "/usr/bin/usbip list -l",  // Explicit path
         "/usr/sbin/usbip list -l", // Alternative path
         "usbip list --local",      // Alternative syntax
         NULL};
+#endif
 
     int cmd_success = 0;
     for (int i = 0; usbip_commands[i] != NULL; i++)
@@ -718,8 +994,15 @@ int bind_device(const char *busid)
         return 0;
     }
 
-    char cmd[128];
+    char cmd[256];
+#ifdef PLATFORM_WINDOWS
+    // Windows: Try different usbipd-win commands
+    snprintf(cmd, sizeof(cmd), "usbipd wsl attach --busid %s", busid);
+#else
+    // Unix/Linux: Standard usbip command
     snprintf(cmd, sizeof(cmd), "usbip bind -b %s", busid);
+#endif
+    
     log_message("INFO", "Attempting to bind device: %s", busid);
 
     int result = exec_command(cmd, NULL, 0) == 0;
@@ -730,6 +1013,9 @@ int bind_device(const char *busid)
     else
     {
         log_message("ERROR", "Failed to bind device: %s", busid);
+#ifdef PLATFORM_WINDOWS
+        log_message("INFO", "Ensure usbipd-win is installed and device is shared");
+#endif
     }
 
     return result;
@@ -743,11 +1029,32 @@ int unbind_device(const char *busid)
         log_message("ERROR", "Invalid busid: %s", busid ? busid : "(null)");
         return 0;
     }
-    char cmd[128];
+    
+    char cmd[256];
+#ifdef PLATFORM_WINDOWS
+    // Windows: Try different usbipd-win commands
+    snprintf(cmd, sizeof(cmd), "usbipd wsl detach --busid %s", busid);
+#else
+    // Unix/Linux: Standard usbip command
     snprintf(cmd, sizeof(cmd), "usbip unbind -b %s", busid);
+#endif
+    
     log_message("INFO", "Attempting to unbind device: %s", busid);
     char output[1024];
     int result = exec_command(cmd, output, sizeof(output)) == 0;
+    
+    if (result)
+    {
+        log_message("INFO", "Successfully unbound device: %s", busid);
+    }
+    else
+    {
+        log_message("ERROR", "Failed to unbind device: %s", busid);
+#ifdef PLATFORM_WINDOWS
+        log_message("INFO", "Ensure usbipd-win is installed and device is attached");
+#endif
+    }
+    
     log_message("DEBUG", "Command output: %s", output);
     return result;
 }
@@ -761,11 +1068,20 @@ int unbind_device_web(int client_socket, const char *busid)
         send_http_response(client_socket, 400, "Bad Request", "application/json", "{\"status\":\"failed\",\"error\":\"Invalid busid\"}");
         return 0;
     }
-    char cmd[128];
+    
+    char cmd[256];
+#ifdef PLATFORM_WINDOWS
+    // Windows: Try different usbipd-win commands
+    snprintf(cmd, sizeof(cmd), "usbipd wsl detach --busid %s", busid);
+#else
+    // Unix/Linux: Standard usbip command
     snprintf(cmd, sizeof(cmd), "usbip unbind -b %s", busid);
+#endif
+    
     log_message("INFO", "Attempting to unbind device: %s", busid);
     char output[1024];
     int result = exec_command(cmd, output, sizeof(output)) == 0;
+    
     if (result)
     {
         log_message("INFO", "Successfully unbound device: %s", busid);
@@ -1090,10 +1406,16 @@ void *handle_client(void *arg)
         send_sse_message(client_socket, json);
 
         // Keep connection alive with periodic heartbeats
+#ifdef PLATFORM_WINDOWS
+        // Windows requires char* for setsockopt and different timeout setting
+        DWORD timeout = 30000; // 30 seconds in milliseconds
+        setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+#else
         struct timeval tv;
         tv.tv_sec = 30; // 30 second timeout for heartbeat
         tv.tv_usec = 0;
         setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
         
         while (g_running)
         {
@@ -1166,7 +1488,7 @@ void *handle_client(void *arg)
                          "\r\n",
                          favicon_len);
                 send(client_socket, response_header, strlen(response_header), 0);
-                send(client_socket, decoded_favicon, favicon_len, 0);
+                send(client_socket, (const char*)decoded_favicon, favicon_len, 0);
             }
         }
         else if (strcmp(path, "/api/devices") == 0)
@@ -1300,7 +1622,11 @@ void *server_thread(void *arg)
     }
 
     int opt = 1;
+#ifdef PLATFORM_WINDOWS
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+#else
     setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
 
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
@@ -1472,6 +1798,13 @@ void print_config()
 
 int install_systemd_service()
 {
+#ifdef PLATFORM_WINDOWS
+    // Windows doesn't support systemd, this function is not applicable
+    log_message("ERROR", "Systemd service installation is not supported on Windows");
+    printf("Error: Systemd service installation is not supported on Windows.\n");
+    printf("To run usbctl as a Windows service, consider using NSSM or similar tools.\n");
+    return 1;
+#else
     // Get current executable path
     char exe_path[512];
     ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
@@ -1518,6 +1851,7 @@ int install_systemd_service()
     printf("  sudo systemctl start usbctl\n");
 
     return 0;
+#endif
 }
 
 // Signal handler for graceful shutdown
@@ -1688,10 +2022,18 @@ int main(int argc, char *argv[])
     // Load configuration
     load_config();
 
+    // Initialize platform-specific networking
+    if (!init_platform_networking())
+    {
+        fprintf(stderr, "Failed to initialize platform networking\n");
+        return 1;
+    }
+
     // Initialize logging system
     if (!init_logging())
     {
         fprintf(stderr, "Failed to initialize logging system\n");
+        cleanup_platform_networking();
         return 1;
     }
 
@@ -1699,6 +2041,7 @@ int main(int argc, char *argv[])
     if (!check_system_compatibility())
     {
         fprintf(stderr, "System compatibility check failed\n");
+        cleanup_platform_networking();
         return 1;
     }
 
@@ -1707,6 +2050,14 @@ int main(int argc, char *argv[])
 
     // Initial device list
     list_usbip_devices();
+    
+    // Restore bound devices from configuration (for system restart recovery)
+    if (g_config.bound_devices_count > 0)
+    {
+        restore_bound_devices();
+        // Refresh device list to update bound states
+        list_usbip_devices();
+    }
 
     // Setup signal handling for graceful shutdown (non-restarting)
     struct sigaction sa;
@@ -1733,6 +2084,7 @@ int main(int argc, char *argv[])
 
     // Cleanup
     pthread_join(poll_thread, NULL);
+    cleanup_platform_networking();
 
     printf("usbctl server stopped.\n");
     return 0;
