@@ -58,6 +58,8 @@ typedef struct
     int verbose_logging;
     char log_file[256];
 } config_t;
+// HTTP响应函数声明
+void send_http_response(int client_socket, int status_code, const char *status_text, const char *content_type, const char *body);
 
 // USB device structure
 typedef struct
@@ -486,9 +488,18 @@ int save_config()
 // Execute command and capture output
 int exec_command(const char *cmd, char *output, size_t output_size)
 {
+    if (!cmd || !output || output_size == 0)
+    {
+        log_message("ERROR", "Invalid arguments for exec_command");
+        return -1;
+    }
+
     FILE *fp = popen(cmd, "r");
     if (!fp)
+    {
+        log_message("ERROR", "Failed to execute command: %s", cmd);
         return -1;
+    }
 
     size_t total = 0;
     char buffer[256];
@@ -504,6 +515,7 @@ int exec_command(const char *cmd, char *output, size_t output_size)
     output[total] = '\0';
 
     int result = pclose(fp);
+    log_message("DEBUG", "Command output: %s", output);
     return WEXITSTATUS(result);
 }
 
@@ -522,10 +534,10 @@ int list_usbip_devices()
 
     // Try different usbip command variations for compatibility
     const char *usbip_commands[] = {
-        "usbip list -l 2>/dev/null",           // Standard command
-        "/usr/bin/usbip list -l 2>/dev/null",  // Explicit path
-        "/usr/sbin/usbip list -l 2>/dev/null", // Alternative path
-        "usbip list --local 2>/dev/null",      // Alternative syntax
+        "usbip list -l",           // Standard command
+        "/usr/bin/usbip list -l",  // Explicit path
+        "/usr/sbin/usbip list -l", // Alternative path
+        "usbip list --local",      // Alternative syntax
         NULL};
 
     int cmd_success = 0;
@@ -612,9 +624,16 @@ int list_usbip_devices()
 // Bind USB device
 int bind_device(const char *busid)
 {
+    if (!busid || strlen(busid) == 0)
+    {
+        log_message("ERROR", "Invalid busid: %s", busid ? busid : "(null)");
+        return 0;
+    }
+
     char cmd[128];
-    snprintf(cmd, sizeof(cmd), "usbip bind -b %s 2>/dev/null", busid);
+    snprintf(cmd, sizeof(cmd), "usbip bind -b %s", busid);
     log_message("INFO", "Attempting to bind device: %s", busid);
+
     int result = exec_command(cmd, NULL, 0) == 0;
     if (result)
     {
@@ -624,23 +643,50 @@ int bind_device(const char *busid)
     {
         log_message("ERROR", "Failed to bind device: %s", busid);
     }
+
     return result;
 }
 
-// Unbind USB device
+// 命令行专用解绑函数
 int unbind_device(const char *busid)
 {
+    if (!busid || strlen(busid) == 0)
+    {
+        log_message("ERROR", "Invalid busid: %s", busid ? busid : "(null)");
+        return 0;
+    }
     char cmd[128];
-    snprintf(cmd, sizeof(cmd), "usbip unbind -b %s 2>/dev/null", busid);
+    snprintf(cmd, sizeof(cmd), "usbip unbind -b %s", busid);
     log_message("INFO", "Attempting to unbind device: %s", busid);
-    int result = exec_command(cmd, NULL, 0) == 0;
+    char output[1024];
+    int result = exec_command(cmd, output, sizeof(output)) == 0;
+    log_message("DEBUG", "Command output: %s", output);
+    return result;
+}
+
+// web专用解绑函数
+int unbind_device_web(int client_socket, const char *busid)
+{
+    if (!busid || strlen(busid) == 0)
+    {
+        log_message("ERROR", "Invalid busid: %s", busid ? busid : "(null)");
+        send_http_response(client_socket, 400, "Bad Request", "application/json", "{\"status\":\"failed\",\"error\":\"Invalid busid\"}");
+        return 0;
+    }
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "usbip unbind -b %s", busid);
+    log_message("INFO", "Attempting to unbind device: %s", busid);
+    char output[1024];
+    int result = exec_command(cmd, output, sizeof(output)) == 0;
     if (result)
     {
         log_message("INFO", "Successfully unbound device: %s", busid);
+        send_http_response(client_socket, 200, "OK", "application/json", output);
     }
     else
     {
         log_message("ERROR", "Failed to unbind device: %s", busid);
+        send_http_response(client_socket, 500, "Internal Server Error", "application/json", output);
     }
     return result;
 }
@@ -1097,7 +1143,7 @@ void *handle_client(void *arg)
                     if (busid_end)
                     {
                         *busid_end = '\0';
-                        if (unbind_device(busid_start))
+                            if (unbind_device(busid_start))
                         {
                             send_http_response(client_socket, 200, "OK", "application/json", "{\"status\":\"success\"}");
                         }
