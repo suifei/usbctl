@@ -8,6 +8,13 @@ SOURCE = usbctl.c
 CC = gcc
 CFLAGS = -std=c99 -O2 -Wall -Wextra -DVERSION=\"$(VERSION)\"
 
+# Output directory (all artifacts go here)
+BUILD_DIR = build
+
+# Ensure build dir exists (order-only prerequisite used later)
+$(BUILD_DIR):
+	@mkdir -p $(BUILD_DIR)
+
 # Platform-specific flags
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
@@ -24,14 +31,17 @@ CC_ARM64 = aarch64-linux-gnu-gcc
 CC_ARMV7 = arm-linux-gnueabihf-gcc
 CC_X86_64 = gcc
 
-# Output binaries
-BIN_NATIVE = $(PROJECT)
-BIN_ARM64 = $(PROJECT)-arm64
-BIN_ARMV7 = $(PROJECT)-armv7
-BIN_X86_64 = $(PROJECT)-x86_64
+# Output binaries (inside build dir)
+BIN_NATIVE = $(BUILD_DIR)/$(PROJECT)
+BIN_ARM64 = $(BUILD_DIR)/$(PROJECT)-arm64
+BIN_ARMV7 = $(BUILD_DIR)/$(PROJECT)-armv7
+BIN_X86_64 = $(BUILD_DIR)/$(PROJECT)-x86_64
 
-# Default target
-.PHONY: all native arm64 armv7 x86_64 clean install uninstall test help available
+# Default goal
+.DEFAULT_GOAL := all
+
+# Phony targets
+.PHONY: all all-force available native arm64 armv7 x86_64 clean install uninstall test help info dev
 
 # Build only what's available by default
 all: native available
@@ -49,8 +59,8 @@ available:
 # Native build (current architecture)
 native: $(BIN_NATIVE)
 
-$(BIN_NATIVE): $(SOURCE)
-	@echo "Building native binary..."
+$(BIN_NATIVE): $(SOURCE) | $(BUILD_DIR)
+	@echo "Building native binary -> $@"
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 	@if command -v strip >/dev/null 2>&1; then strip $@; fi
 	@echo "Built: $@ ($$(ls -lh $@ | awk '{print $$5}'))"
@@ -58,8 +68,8 @@ $(BIN_NATIVE): $(SOURCE)
 # ARM64 build (Raspberry Pi 4/5)
 arm64: $(BIN_ARM64)
 
-$(BIN_ARM64): $(SOURCE)
-	@echo "Building ARM64 binary..."
+$(BIN_ARM64): $(SOURCE) | $(BUILD_DIR)
+	@echo "Building ARM64 binary -> $@"
 	@if ! command -v $(CC_ARM64) >/dev/null 2>&1; then \
 		echo "  → $(CC_ARM64) not found. Skipping ARM64 build."; \
 		echo "  → To install on Ubuntu/Debian: sudo apt-get install gcc-aarch64-linux-gnu"; \
@@ -73,8 +83,8 @@ $(BIN_ARM64): $(SOURCE)
 # ARMv7 build (Raspberry Pi 3, Zero 2)
 armv7: $(BIN_ARMV7)
 
-$(BIN_ARMV7): $(SOURCE)
-	@echo "Building ARMv7 binary..."
+$(BIN_ARMV7): $(SOURCE) | $(BUILD_DIR)
+	@echo "Building ARMv7 binary -> $@"
 	@if ! command -v $(CC_ARMV7) >/dev/null 2>&1; then \
 		echo "  → $(CC_ARMV7) not found. Skipping ARMv7 build."; \
 		echo "  → To install on Ubuntu/Debian: sudo apt-get install gcc-arm-linux-gnueabihf"; \
@@ -88,9 +98,9 @@ $(BIN_ARMV7): $(SOURCE)
 # x86_64 build
 x86_64: $(BIN_X86_64)
 
-$(BIN_X86_64): $(SOURCE)
-	@echo "Building x86_64 binary..."
-	@if [ "$(UNAME_S)" = "Darwin" ] && [ "$$(uname -m)" = "x86_64" ]; then \
+$(BIN_X86_64): $(SOURCE) | $(BUILD_DIR)
+	@echo "Building x86_64 binary -> $@"
+	@if [ "$(UNAME_S)" = "Darwin" ] && [ "$(shell uname -m)" = "x86_64" ]; then \
 		echo "  → Skipping x86_64 build (same as native on this platform)"; \
 		exit 1; \
 	fi
@@ -101,7 +111,7 @@ $(BIN_X86_64): $(SOURCE)
 # Clean build artifacts
 clean:
 	@echo "Cleaning build artifacts..."
-	rm -f $(BIN_NATIVE) $(BIN_ARM64) $(BIN_ARMV7) $(BIN_X86_64)
+	rm -rf $(BUILD_DIR)
 	@echo "Clean complete"
 
 # Install native binary to system
@@ -132,14 +142,14 @@ uninstall:
 # Test native binary
 test: $(BIN_NATIVE)
 	@echo "Testing $(PROJECT) binary..."
-	@./$(BIN_NATIVE) --version
-	@./$(BIN_NATIVE) --help | head -3
+	@$(BIN_NATIVE) --version
+	@$(BIN_NATIVE) --help | head -3
 	@echo "Basic tests passed"
 
 # Development server (runs in foreground)
 dev: $(BIN_NATIVE)
 	@echo "Starting development server..."
-	./$(BIN_NATIVE) -p 11980
+	$(BIN_NATIVE) -p 11980
 
 # Show help
 help:
@@ -171,6 +181,7 @@ info:
 	@echo "Project: $(PROJECT) v$(VERSION)"
 	@echo "Source: $(SOURCE)"
 	@echo "Compiler: $(CC)"
+	@echo "Build dir: $(BUILD_DIR)"
 	@echo "Flags: $(CFLAGS) $(LDFLAGS)"
 	@echo ""
 	@echo "Available cross-compilers:"

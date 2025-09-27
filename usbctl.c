@@ -14,6 +14,11 @@
  * Usage: ./usbctl [options]
  */
 
+// Enable POSIX/GNU extensions for readlink and others before any headers
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +34,9 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <sys/time.h>
+#include <sys/select.h>
+#include <sys/wait.h>
 
 #define VERSION "1.0.0"
 #define AUTHOR "github.com/suifei"
@@ -674,17 +682,46 @@ void send_http_response(int client_socket, int status_code, const char *status_t
 // Generate JSON for devices
 void generate_devices_json(char *buffer, size_t buffer_size)
 {
-    strcpy(buffer, "[");
+    if (buffer_size == 0) return;
+    buffer[0] = '\0';
+    strncat(buffer, "[", buffer_size - 1);
     for (int i = 0; i < g_device_count; i++)
     {
-        char device_json[512];
-        snprintf(device_json, sizeof(device_json),
-                 "%s{\"busid\":\"%s\",\"info\":\"%s\",\"bound\":%s}",
-                 i > 0 ? "," : "",
-                 g_devices[i].busid,
-                 g_devices[i].info,
-                 g_devices[i].bound ? "true" : "false");
-        strncat(buffer, device_json, buffer_size - strlen(buffer) - 1);
+        // Sanitize / truncate info to avoid overly large SSE frames
+        const char *info_src = g_devices[i].info;
+        char info_sanitized[256];
+        size_t k = 0;
+        for (size_t j = 0; info_src[j] && k < sizeof(info_sanitized) - 1; j++)
+        {
+            unsigned char c = (unsigned char)info_src[j];
+            // Escape quotes and backslashes minimally
+            if (c == '"' || c == '\\') {
+                if (k + 2 >= sizeof(info_sanitized) - 1) break;
+                info_sanitized[k++] = '\\';
+                info_sanitized[k++] = c;
+            } else if ((c >= 32 && c < 127)) {
+                info_sanitized[k++] = c;
+            } else {
+                // skip non printable
+            }
+        }
+        info_sanitized[k] = '\0';
+
+        char device_json[384];
+        int written = snprintf(device_json, sizeof(device_json),
+                               "%s{\"busid\":\"%s\",\"info\":\"%s\",\"bound\":%s}",
+                               i > 0 ? "," : "",
+                               g_devices[i].busid,
+                               info_sanitized,
+                               g_devices[i].bound ? "true" : "false");
+        if (written < 0) continue;
+        size_t remaining = buffer_size - strlen(buffer) - 1;
+        if ((size_t)written > remaining) {
+            // No more space; close array and stop
+            strncat(buffer, "]", buffer_size - strlen(buffer) - 1);
+            return;
+        }
+        strncat(buffer, device_json, remaining);
     }
     strncat(buffer, "]", buffer_size - strlen(buffer) - 1);
 }
@@ -692,9 +729,19 @@ void generate_devices_json(char *buffer, size_t buffer_size)
 // Send SSE message
 ssize_t send_sse_message(int client_socket, const char *data)
 {
+    // Frame limited to 4KB to avoid truncation warnings and large packets
     char response[4096];
-    snprintf(response, sizeof(response), "data: %s\n\n", data);
-    return send(client_socket, response, strlen(response), MSG_NOSIGNAL);
+    const size_t prefix_len = 6; // "data: "
+    const size_t suffix_len = 2; // "\n\n"
+    size_t max_payload = sizeof(response) - prefix_len - suffix_len - 1;
+    size_t data_len = strlen(data);
+    if (data_len > max_payload) data_len = max_payload;
+    memcpy(response, "data: ", prefix_len);
+    memcpy(response + prefix_len, data, data_len);
+    response[prefix_len + data_len] = '\n';
+    response[prefix_len + data_len + 1] = '\n';
+    response[prefix_len + data_len + 2] = '\0';
+    return send(client_socket, response, prefix_len + data_len + suffix_len, MSG_NOSIGNAL);
 }
 
 // Send SSE headers
