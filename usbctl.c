@@ -128,13 +128,14 @@ static const char *EMBEDDED_FAVICON =
 // Embedded CSS (Ultra-compact responsive design with modern aesthetics)
 static const char *EMBEDDED_CSS =
     "*{margin:0;padding:0;box-sizing:border-box}"
-    "body{font:14px/1.4 system-ui,-apple-system,sans-serif;background:#f8f9fa;color:#333;padding:10px}"
+    "body{font:14px/1.4 system-ui,-apple-system,sans-serif;background:#f8f9fa;color:#333;padding:10px;padding-bottom:180px}"
     "header{text-align:center;margin-bottom:20px;padding:10px;background:linear-gradient(135deg,#007bff,#6610f2);color:#fff;border-radius:8px}"
     ".logo{width:32px;height:32px;margin:0 8px;vertical-align:middle}"
     "h1{font-size:24px;margin:5px 0}"
     ".controls{text-align:center;margin-bottom:15px}"
     ".lang-btn{background:#28a745;color:#fff;border:none;padding:4px 8px;border-radius:4px;margin:0 2px;cursor:pointer;font-size:11px}"
     ".lang-btn.active{background:#155724}"
+    ".main-content{margin-bottom:20px}"
     "table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1)}"
     "th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #dee2e6;font-size:13px}"
     "th{background:#007bff;color:#fff;font-weight:600;position:sticky;top:0}"
@@ -148,21 +149,35 @@ static const char *EMBEDDED_CSS =
     ".btn-bind:hover{background:#218838}"
     ".btn-unbind:hover{background:#c82333}"
     "#status{position:fixed;top:10px;right:10px;padding:4px 8px;background:#17a2b8;color:#fff;border-radius:4px;font-size:11px;z-index:1000}"
-    ".footer{position:fixed;bottom:10px;left:50%;transform:translateX(-50%);text-align:center;font-size:11px;color:#6c757d;background:rgba(255,255,255,0.95);padding:5px 15px;border-radius:15px;box-shadow:0 2px 10px rgba(0,0,0,0.1);z-index:999}"
+    ".log-container{position:fixed;bottom:0;left:0;right:0;height:150px;background:#fff;border-top:2px solid #007bff;box-shadow:0 -2px 10px rgba(0,0,0,0.1);z-index:998}"
+    ".log-header{display:flex;justify-content:space-between;align-items:center;padding:8px 15px;background:#f8f9fa;border-bottom:1px solid #dee2e6}"
+    ".log-title{font-weight:600;color:#333;font-size:13px}"
+    ".clear-log-btn{background:#6c757d;color:#fff;padding:3px 8px;border:none;border-radius:3px;cursor:pointer;font-size:11px}"
+    ".clear-log-btn:hover{background:#5a6268}"
+    ".log-content{height:calc(150px - 40px);overflow-y:auto;padding:8px;font-family:monospace;font-size:12px;line-height:1.3}"
+    ".log-entry{margin-bottom:4px;padding:2px 0;border-left:3px solid transparent;padding-left:8px}"
+    ".log-success{color:#155724;border-left-color:#28a745;background:#d4edda}"
+    ".log-error{color:#721c24;border-left-color:#dc3545;background:#f8d7da}"
+    ".log-info{color:#0c5460;border-left-color:#17a2b8;background:#d1ecf1}"
+    ".log-timestamp{color:#6c757d;font-size:10px}"
+    ".footer{position:fixed;bottom:155px;left:50%;transform:translateX(-50%);text-align:center;font-size:11px;color:#6c757d;background:rgba(255,255,255,0.95);padding:5px 15px;border-radius:15px;box-shadow:0 2px 10px rgba(0,0,0,0.1);z-index:999}"
     ".footer a{color:#007bff;text-decoration:none}"
     "@media(max-width:768px){"
-    "body{padding:5px}"
+    "body{padding:5px;padding-bottom:180px}"
     "h1{font-size:20px}"
     "th,td{padding:6px 8px;font-size:12px}"
     "button{padding:3px 6px;font-size:10px}"
     ".logo{width:24px;height:24px}"
     ".controls{margin-bottom:10px}"
+    ".log-container{height:140px}"
+    ".log-content{height:calc(140px - 40px);font-size:11px}"
+    ".footer{bottom:145px}"
     "}";
 
 // Embedded JavaScript (Ultra-optimized with smart i18n)
 const char *EMBEDDED_JS =
-    "let eventSource,devices=[],lang='en';"
-    "const i18n={'en':{'title':'USB/IP Manager','device':'Device Info','busid':'Bus ID','status':'Status','action':'Action','bound':'Bound','unbound':'Unbound','bind':'Bind','unbind':'Unbind','connected':'Connected','disconnected':'Disconnected','error':'Error','author':'Author'},'zh':{'title':'USB/IP 管理器','device':'设备信息','busid':'总线ID','status':'状态','action':'操作','bound':'已绑定','unbound':'未绑定','bind':'绑定','unbind':'解绑','connected':'已连接','disconnected':'已断开','error':'错误','author':'作者'}};"
+    "let eventSource,devices=[],lang='en',logEntries=[];"
+    "const i18n={'en':{'title':'USB/IP Manager','device':'Device Info','busid':'Bus ID','status':'Status','action':'Action','bound':'Bound','unbound':'Unbound','bind':'Bind','unbind':'Unbind','connected':'Connected','disconnected':'Disconnected','error':'Error','author':'Author','log_title':'Operation Log','clear':'Clear','bind_success':'Device {busid} bound successfully','unbind_success':'Device {busid} unbound successfully','bind_error':'Error binding device {busid}: {error}','unbind_error':'Error unbinding device {busid}: {error}'},'zh':{'title':'USB/IP 管理器','device':'设备信息','busid':'总线ID','status':'状态','action':'操作','bound':'已绑定','unbound':'未绑定','bind':'绑定','unbind':'解绑','connected':'已连接','disconnected':'已断开','error':'错误','author':'作者','log_title':'操作日志','clear':'清除','bind_success':'设备 {busid} 绑定成功','unbind_success':'设备 {busid} 解绑成功','bind_error':'绑定设备 {busid} 失败: {error}','unbind_error':'解绑设备 {busid} 失败: {error}'}};"
     "function detectLang(){"
     "try{"
     "const stored=localStorage.getItem('usbctl_lang');"
@@ -173,7 +188,7 @@ const char *EMBEDDED_JS =
     "return 'en';"
     "}catch(e){return 'en';}"
     "}"
-    "function t(k){return i18n[lang][k]||k;}"
+    "function t(k,vars){let text=i18n[lang][k]||k;if(vars){Object.keys(vars).forEach(key=>{text=text.replace(`{${key}}`,vars[key]);})}return text;}"
     "function setLang(l){lang=l;localStorage.setItem('usbctl_lang',l);updateUI();}"
     "function updateUI(){"
     "document.title=`usbctl - ${t('title')}`;"
@@ -182,7 +197,11 @@ const char *EMBEDDED_JS =
     "const ths=document.querySelectorAll('th');"
     "if(ths.length>=4){ths[0].textContent=t('device');ths[1].textContent=t('busid');ths[2].textContent=t('status');ths[3].textContent=t('action');}"
     "document.querySelectorAll('.lang-btn').forEach(b=>b.classList.toggle('active',b.dataset.lang===lang));"
-    "render();"
+    "const logTitle=document.querySelector('.log-title');"
+    "if(logTitle)logTitle.textContent=t('log_title');"
+    "const clearBtn=document.querySelector('.clear-log-btn');"
+    "if(clearBtn)clearBtn.textContent=t('clear');"
+    "render();renderLog();"
     "}"
     "function connectSSE(){"
     "if(eventSource)eventSource.close();"
@@ -204,15 +223,60 @@ const char *EMBEDDED_JS =
     "`<td><button class=\"${d.bound?'btn-unbind':'btn-bind'}\" onclick=\"toggle('${d.busid}')\">`+"
     "`${t(d.bound?'unbind':'bind')}</button></td></tr>`).join('');"
     "}"
+    "function addLog(type,message){"
+    "const timestamp=new Date().toLocaleTimeString();"
+    "const entry={type,message,timestamp};"
+    "logEntries.unshift(entry);"
+    "if(logEntries.length>100)logEntries.pop();"
+    "renderLog();"
+    "}"
+    "function renderLog(){"
+    "const logContent=document.getElementById('logContent');"
+    "if(!logContent)return;"
+    "logContent.innerHTML=logEntries.map(entry=>"
+    "`<div class=\"log-entry log-${entry.type}\">`+"
+    "`<span class=\"log-timestamp\">[${entry.timestamp}]</span> ${entry.message}`+"
+    "`</div>`).join('');"
+    "logContent.scrollTop=0;"
+    "}"
+    "function clearLog(){"
+    "logEntries=[];"
+    "renderLog();"
+    "}"
     "function toggle(busid){"
     "const device=devices.find(d=>d.busid===busid);"
     "if(!device)return;"
     "const button=event.target;"
+    "const action=device.bound?'unbind':'bind';"
     "button.disabled=true;"
-    "fetch(`/${device.bound?'unbind':'bind'}`,{method:'POST',headers:{'Content-Type':'application/json'},"
+    "fetch(`/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},"
     "body:JSON.stringify({busid})})"
-    ".then(response=>response.ok?loadDevices():Promise.reject('Request failed'))"
-    ".catch(console.error)"
+    ".then(response=>{"
+    "if(response.ok){"
+    "addLog('success',t(`${action}_success`,{busid}));"
+    "loadDevices();"
+    "}else{"
+    "return response.text().then(text=>{"
+    "let errorMsg='Unknown error';"
+    "try{"
+    "const data=JSON.parse(text);"
+    "if(data.error){"
+    "errorMsg=data.error.trim();"
+    "const errorMatch=errorMsg.match(/error[:\\s]*(.+?)(?:\\n|$)/i);"
+    "if(errorMatch)errorMsg=errorMatch[1];"
+    "}"
+    "}catch(e){"
+    "const errorMatch=text.match(/error[:\\s]*(.+?)(?:\\n|$)/i);"
+    "if(errorMatch)errorMsg=errorMatch[1];"
+    "}"
+    "addLog('error',t(`${action}_error`,{busid,error:errorMsg}));"
+    "throw new Error(errorMsg);"
+    "});"
+    "}"
+    "})"
+    ".catch(err=>{"
+    "console.error(err);"
+    "})"
     ".finally(()=>button.disabled=false);"
     "}"
     "function loadDevices(){"
@@ -235,8 +299,17 @@ const char *EMBEDDED_HTML =
     "<button class=\"lang-btn\" data-lang=\"zh\" onclick=\"setLang('zh')\">中文</button>"
     "</div>"
     "<div id=\"status\">Connecting...</div>"
+    "<div class=\"main-content\">"
     "<table><thead><tr><th>Device Info</th><th>Bus ID</th><th>Status</th><th>Action</th></tr></thead>"
     "<tbody></tbody></table>"
+    "</div>"
+    "<div class=\"log-container\">"
+    "<div class=\"log-header\">"
+    "<span class=\"log-title\">Operation Log</span>"
+    "<button class=\"clear-log-btn\" onclick=\"clearLog()\">Clear</button>"
+    "</div>"
+    "<div class=\"log-content\" id=\"logContent\"></div>"
+    "</div>"
     "<div class=\"footer\">Powered by <a href=\"https://github.com/suifei/usbctl\" target=\"_blank\">usbctl v" VERSION "</a> | "
     "<a href=\"https://github.com/suifei\" target=\"_blank\">github.com/suifei</a></div>"
     "<script>%s</script></body></html>";
@@ -1118,13 +1191,27 @@ void *handle_client(void *arg)
                     if (busid_end)
                     {
                         *busid_end = '\0';
-                        if (bind_device(busid_start))
+                        char cmd[256];
+                        char output[1024] = {0};
+                        // Redirect stderr to stdout to capture error messages
+                        snprintf(cmd, sizeof(cmd), "usbip bind -b %s 2>&1", busid_start);
+                        log_message("INFO", "Attempting to bind device: %s", busid_start);
+                        
+                        if (exec_command(cmd, output, sizeof(output)) == 0)
                         {
+                            log_message("INFO", "Successfully bound device: %s", busid_start);
                             send_http_response(client_socket, 200, "OK", "application/json", "{\"status\":\"success\"}");
                         }
                         else
                         {
-                            send_http_response(client_socket, 500, "Internal Server Error", "application/json", "{\"status\":\"failed\"}");
+                            log_message("ERROR", "Failed to bind device: %s", busid_start);
+                            char error_response[2048];
+                            // Clean up the error message
+                            char *clean_output = output;
+                            while (*clean_output == '\n' || *clean_output == '\r' || *clean_output == ' ') clean_output++;
+                            if (strlen(clean_output) == 0) strcpy(clean_output, "Unknown error");
+                            snprintf(error_response, sizeof(error_response), "{\"status\":\"failed\",\"error\":\"%s\"}", clean_output);
+                            send_http_response(client_socket, 500, "Internal Server Error", "application/json", error_response);
                         }
                         // Trigger immediate update
                         list_usbip_devices();
@@ -1143,13 +1230,27 @@ void *handle_client(void *arg)
                     if (busid_end)
                     {
                         *busid_end = '\0';
-                            if (unbind_device(busid_start))
+                        char cmd[256];
+                        char output[1024] = {0};
+                        // Redirect stderr to stdout to capture error messages
+                        snprintf(cmd, sizeof(cmd), "usbip unbind -b %s 2>&1", busid_start);
+                        log_message("INFO", "Attempting to unbind device: %s", busid_start);
+                        
+                        if (exec_command(cmd, output, sizeof(output)) == 0)
                         {
+                            log_message("INFO", "Successfully unbound device: %s", busid_start);
                             send_http_response(client_socket, 200, "OK", "application/json", "{\"status\":\"success\"}");
                         }
                         else
                         {
-                            send_http_response(client_socket, 500, "Internal Server Error", "application/json", "{\"status\":\"failed\"}");
+                            log_message("ERROR", "Failed to unbind device: %s", busid_start);
+                            char error_response[2048];
+                            // Clean up the error message
+                            char *clean_output = output;
+                            while (*clean_output == '\n' || *clean_output == '\r' || *clean_output == ' ') clean_output++;
+                            if (strlen(clean_output) == 0) strcpy(clean_output, "Unknown error");
+                            snprintf(error_response, sizeof(error_response), "{\"status\":\"failed\",\"error\":\"%s\"}", clean_output);
+                            send_http_response(client_socket, 500, "Internal Server Error", "application/json", error_response);
                         }
                         // Trigger immediate update
                         list_usbip_devices();
