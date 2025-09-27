@@ -86,6 +86,7 @@ static client_t g_clients[MAX_CLIENTS];
 static int g_client_count = 0;
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_running = 1;
+static volatile int g_server_started = 0;
 static FILE *g_log_file = NULL;
 static int g_usbip_error_shown = 0;
 
@@ -588,7 +589,11 @@ int exec_command(const char *cmd, char *output, size_t output_size)
     output[total] = '\0';
 
     int result = pclose(fp);
-    log_message("DEBUG", "Command output: %s", output);
+    // Only log command output during startup or if verbose logging enabled
+    if (!g_server_started || g_config.verbose_logging)
+    {
+        log_message("DEBUG", "Command output: %s", output);
+    }
     return WEXITSTATUS(result);
 }
 
@@ -619,7 +624,11 @@ int list_usbip_devices()
         if (exec_command(usbip_commands[i], output, sizeof(output)) == 0)
         {
             cmd_success = 1;
-            log_message("DEBUG", "Successfully executed: %s", usbip_commands[i]);
+            // Only log command success during startup or if verbose logging enabled
+            if (!g_server_started || g_config.verbose_logging)
+            {
+                log_message("DEBUG", "Successfully executed: %s", usbip_commands[i]);
+            }
             break;
         }
     }
@@ -668,7 +677,11 @@ int list_usbip_devices()
                     busid_start++;
                 sscanf(busid_start, "%15s", current->busid);
                 current->bound = is_device_bound(current->busid);
-                log_message("DEBUG", "Found device: %s (bound: %d)", current->busid, current->bound);
+                // Only log device discovery during startup or if verbose logging enabled
+                if (!g_server_started || g_config.verbose_logging)
+                {
+                    log_message("DEBUG", "Found device: %s (bound: %d)", current->busid, current->bound);
+                }
             }
         }
         else if (current && (strchr(line, ':') || strstr(line, "ID ")))
@@ -1701,6 +1714,9 @@ int main(int argc, char *argv[])
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN); // Ignore broken pipe signals
+
+    // Mark server as started to reduce verbose logging in polling thread
+    g_server_started = 1;
 
     // Start device polling thread
     pthread_t poll_thread;
