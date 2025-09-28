@@ -2,6 +2,10 @@
 
 # usbctl - USB/IP 设备 Web 管理器
 
+项目架构图
+
+![项目架构图](./architecture.svg)
+
 ![usbctl 响应式界面截图](usbctl.jpg)
 
 ## 项目简介

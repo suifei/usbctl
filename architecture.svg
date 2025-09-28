@@ -1,0 +1,164 @@
+<svg viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- 渐变定义 -->
+    <linearGradient id="raspberryPiGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#8bc34a;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#4caf50;stop-opacity:1" />
+    </linearGradient>
+    
+    <linearGradient id="windowsGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#2196f3;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1976d2;stop-opacity:1" />
+    </linearGradient>
+    
+    <linearGradient id="usbGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#ff9800;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#f57c00;stop-opacity:1" />
+    </linearGradient>
+    
+    <!-- 无线信号动画 -->
+    <animate id="wifiPulse" attributeName="opacity" values="0.3;1;0.3" dur="2s" repeatCount="indefinite"/>
+  </defs>
+  
+  <!-- 背景 -->
+  <rect width="800" height="600" fill="#f5f5f5" stroke="#ddd" stroke-width="2"/>
+  
+  <!-- 标题 -->
+  <text x="400" y="40" text-anchor="middle" font-family="Arial, sans-serif" font-size="24" font-weight="bold" fill="#333">
+    USB透传项目架构图
+  </text>
+  
+  <!-- 树莓派部分 -->
+  <g id="raspberry-pi-section">
+    <!-- 树莓派设备 -->
+    <rect x="50" y="200" width="140" height="100" rx="10" fill="url(#raspberryPiGrad)" stroke="#4caf50" stroke-width="2"/>
+    <text x="120" y="225" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold" fill="white">树莓派</text>
+    <text x="120" y="245" text-anchor="middle" font-family="Arial" font-size="12" fill="white">Raspberry Pi</text>
+    <text x="120" y="265" text-anchor="middle" font-family="Arial" font-size="10" fill="white">usbctl服务端</text>
+    
+    <!-- USB端口指示 -->
+    <rect x="190" y="230" width="20" height="10" fill="#333" rx="2"/>
+    <rect x="190" y="250" width="20" height="10" fill="#333" rx="2"/>
+    <rect x="190" y="270" width="20" height="10" fill="#333" rx="2"/>
+  </g>
+  
+  <!-- USB设备 -->
+  <g id="usb-devices">
+    <!-- 键盘 -->
+    <rect x="250" y="150" width="100" height="40" rx="5" fill="url(#usbGrad)" stroke="#f57c00" stroke-width="2"/>
+    <text x="300" y="175" text-anchor="middle" font-family="Arial" font-size="12" font-weight="bold" fill="white">键盘</text>
+    
+    <!-- 鼠标 -->
+    <ellipse cx="300" cy="230" rx="30" ry="20" fill="url(#usbGrad)" stroke="#f57c00" stroke-width="2"/>
+    <text x="300" y="235" text-anchor="middle" font-family="Arial" font-size="12" font-weight="bold" fill="white">鼠标</text>
+    
+    <!-- 其他USB设备 -->
+    <rect x="260" y="270" width="80" height="30" rx="5" fill="url(#usbGrad)" stroke="#f57c00" stroke-width="2"/>
+    <text x="300" y="290" text-anchor="middle" font-family="Arial" font-size="11" font-weight="bold" fill="white">其他设备</text>
+    
+    <!-- USB连接线 -->
+    <path d="M210 240 Q230 200 250 170" stroke="#666" stroke-width="3" fill="none" stroke-dasharray="5,5"/>
+    <path d="M210 250 Q230 240 270 230" stroke="#666" stroke-width="3" fill="none"/>
+    <path d="M210 260 Q235 265 260 285" stroke="#666" stroke-width="3" fill="none" stroke-dasharray="5,5"/>
+  </g>
+  
+  <!-- 无线网络部分 -->
+  <g id="wireless-network">
+    <!-- 无线信号图标 -->
+    <g transform="translate(420,200)">
+      <circle r="40" fill="none" stroke="#2196f3" stroke-width="2" opacity="0.3">
+        <animate attributeName="r" values="20;40;60" dur="2s" repeatCount="indefinite"/>
+        <animate attributeName="opacity" values="0.8;0.3;0.1" dur="2s" repeatCount="indefinite"/>
+      </circle>
+      <circle r="25" fill="none" stroke="#2196f3" stroke-width="3" opacity="0.6">
+        <animate attributeName="r" values="15;25;35" dur="2s" repeatCount="indefinite"/>
+        <animate attributeName="opacity" values="1;0.6;0.2" dur="2s" repeatCount="indefinite"/>
+      </circle>
+      <circle r="10" fill="#2196f3" opacity="0.8"/>
+    </g>
+    
+    <!-- 网络标签 -->
+    <text x="420" y="280" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold" fill="#2196f3">
+      无线网络 (WiFi/以太网)
+    </text>
+    <text x="420" y="300" text-anchor="middle" font-family="Arial" font-size="12" fill="#666">
+      IP网络透传
+    </text>
+  </g>
+  
+  <!-- Windows客户端部分 -->
+  <g id="windows-client">
+    <!-- Windows电脑 -->
+    <rect x="580" y="180" width="160" height="120" rx="10" fill="url(#windowsGrad)" stroke="#1976d2" stroke-width="2"/>
+    <rect x="590" y="190" width="140" height="80" rx="5" fill="#fff" stroke="#ccc"/>
+    <text x="660" y="240" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold" fill="#1976d2">
+      Windows客户端
+    </text>
+    <text x="660" y="260" text-anchor="middle" font-family="Arial" font-size="11" fill="#666">
+      usbctl客户端软件
+    </text>
+    
+    <!-- Windows logo -->
+    <g transform="translate(620,210)">
+      <rect width="8" height="8" fill="#2196f3"/>
+      <rect x="10" width="8" height="8" fill="#2196f3"/>
+      <rect y="10" width="8" height="8" fill="#2196f3"/>
+      <rect x="10" y="10" width="8" height="8" fill="#2196f3"/>
+    </g>
+  </g>
+  
+  <!-- 数据流向箭头 -->
+  <g id="data-flow">
+    <!-- 从树莓派到无线网络 -->
+    <path d="M190 250 Q295 280 340 300" stroke="#4caf50" stroke-width="4" fill="none" marker-end="url(#arrowhead)"/>
+    
+    <!-- 从无线网络到Windows -->
+    <path d="M460 300 Q520 270 580 240" stroke="#2196f3" stroke-width="4" fill="none" marker-end="url(#arrowhead)"/>
+    
+    <!-- 箭头标记定义 -->
+    <defs>
+      <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+        <polygon points="0 0, 10 3.5, 0 7" fill="#666"/>
+      </marker>
+    </defs>
+  </g>
+  
+  <!-- 步骤说明 -->
+  <g id="steps">
+    <text x="50" y="450" font-family="Arial" font-size="16" font-weight="bold" fill="#333">工作流程：</text>
+    
+    <g transform="translate(50,470)">
+      <circle cx="10" cy="10" r="8" fill="#4caf50"/>
+      <text x="10" y="15" text-anchor="middle" font-family="Arial" font-size="12" font-weight="bold" fill="white">1</text>
+      <text x="30" y="15" font-family="Arial" font-size="14" fill="#333">USB设备连接到树莓派</text>
+    </g>
+    
+    <g transform="translate(50,500)">
+      <circle cx="10" cy="10" r="8" fill="#2196f3"/>
+      <text x="10" y="15" text-anchor="middle" font-family="Arial" font-size="12" font-weight="bold" fill="white">2</text>
+      <text x="30" y="15" font-family="Arial" font-size="14" fill="#333">通过无线网络进行IP透传</text>
+    </g>
+    
+    <g transform="translate(50,530)">
+      <circle cx="10" cy="10" r="8" fill="#ff9800"/>
+      <text x="10" y="15" text-anchor="middle" font-family="Arial" font-size="12" font-weight="bold" fill="white">3</text>
+      <text x="30" y="15" font-family="Arial" font-size="14" fill="#333">Windows客户端软件接收并模拟USB设备</text>
+    </g>
+  </g>
+  
+  <!-- 特性说明 -->
+  <g id="features">
+    <rect x="400" y="450" width="350" height="120" rx="10" fill="#fff" stroke="#ddd" stroke-width="2"/>
+    <text x="575" y="475" text-anchor="middle" font-family="Arial" font-size="16" font-weight="bold" fill="#333">项目特性</text>
+    
+    <text x="420" y="500" font-family="Arial" font-size="13" fill="#333">✓ 支持复杂功能的有线设备无线化</text>
+    <text x="420" y="520" font-family="Arial" font-size="13" fill="#333">✓ 保持设备完整功能特性</text>
+    <text x="420" y="540" font-family="Arial" font-size="13" fill="#333">✓ 跨平台USB透传解决方案</text>
+    <text x="420" y="560" font-family="Arial" font-size="13" fill="#333">✓ 低延迟网络传输</text>
+  </g>
+  
+  <!-- 项目链接 -->
+  <text x="400" y="590" text-anchor="middle" font-family="Arial" font-size="12" fill="#666">
+    项目地址: https://github.com/suifei/usbctl
+  </text>
+</svg>
