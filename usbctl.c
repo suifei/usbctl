@@ -3,7 +3,7 @@
  * A lightweight single-file web interface for USB/IP device management
  *
  * Features:
- * - Single executable file (~300KB static build)
+ * - Single executable file
  * - Embedded HTML/CSS/JS resources
  * - Configuration persistence
  * - Real-time Server-Sent Events updates
