@@ -306,8 +306,15 @@ const char *EMBEDDED_JS =
     "body:JSON.stringify({busid})})"
     ".then(response=>{"
     "if(response.ok){"
+    "return response.json().then(data=>{"
     "addLog('success',t(`${action}_success`,{busid}));"
+    "if(data.devices){"
+    "devices=data.devices;"
+    "render();"
+    "}else{"
     "loadDevices();"
+    "}"
+    "});"
     "}else{"
     "return response.text().then(text=>{"
     "let errorMsg='Unknown error';"
@@ -1537,7 +1544,16 @@ void *handle_client(void *arg)
                         if (exec_command(cmd, output, sizeof(output)) == 0)
                         {
                             log_message("INFO", "Successfully bound device: %s", busid_start);
-                            send_http_response(client_socket, 200, "OK", "application/json", "{\"status\":\"success\"}");
+                            // Update device list and generate response with devices
+                            list_usbip_devices();
+                            char response_json[8192];
+                            char devices_json[4096];
+                            generate_devices_json(devices_json, sizeof(devices_json));
+                            snprintf(response_json, sizeof(response_json), 
+                                    "{\"status\":\"success\",\"devices\":%s}", devices_json);
+                            send_http_response(client_socket, 200, "OK", "application/json", response_json);
+                            // Also broadcast update to SSE clients
+                            broadcast_devices_update();
                         }
                         else
                         {
@@ -1576,7 +1592,16 @@ void *handle_client(void *arg)
                         if (exec_command(cmd, output, sizeof(output)) == 0)
                         {
                             log_message("INFO", "Successfully unbound device: %s", busid_start);
-                            send_http_response(client_socket, 200, "OK", "application/json", "{\"status\":\"success\"}");
+                            // Update device list and generate response with devices
+                            list_usbip_devices();
+                            char response_json[8192];
+                            char devices_json[4096];
+                            generate_devices_json(devices_json, sizeof(devices_json));
+                            snprintf(response_json, sizeof(response_json), 
+                                    "{\"status\":\"success\",\"devices\":%s}", devices_json);
+                            send_http_response(client_socket, 200, "OK", "application/json", response_json);
+                            // Also broadcast update to SSE clients
+                            broadcast_devices_update();
                         }
                         else
                         {
