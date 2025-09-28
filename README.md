@@ -10,7 +10,7 @@
 
 ## 项目简介
 
-**usbctl** 是一个轻量级、跨平台的 USB/IP 设备管理 Web 界面，支持 PC 和移动端响应式访问。它集成了设备列表、绑定/解绑操作、实时状态推送（SSE）、操作日志等功能，适用于 Linux（包括树莓派）、Windows（WSL/usbipd-win）、macOS 等环境。
+**usbctl** 是一个轻量级、跨平台的 USB/IP 设备管理 Web 界面，支持 PC 和移动端响应式访问。它集成了设备列表、绑定/解绑操作、实时状态推送（SSE）、操作日志等功能，适用于 Linux（包括树莓派、Openwrt）、Windows（WSL/usbipd-win）、macOS 等环境。
 
 - 单文件 C 语言实现
 - 内嵌 HTML/CSS/JS 资源，无需外部依赖
