@@ -3,12 +3,10 @@ name: C/C++ CI and Release
 on:
   push:
     branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
-  # 当推送tag时触发发布
-  push:
     tags:
       - 'v*'
+  pull_request:
+    branches: [ "main", "master" ]
 
 # 设置工作流权限
 permissions:
