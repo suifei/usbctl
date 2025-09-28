@@ -73,7 +73,7 @@ CC_linux-s390x := s390x-linux-gnu-gcc
 # Windows (MinGW)
 CC_windows-x86_64 := x86_64-w64-mingw32-gcc
 CC_windows-i386 := i686-w64-mingw32-gcc
-CC_windows-arm64 := clang --target=aarch64-pc-windows-msvc
+# CC_windows-arm64 := clang --target=aarch64-pc-windows-msvc
 
 # Architecture-specific CFLAGS
 CFLAGS_linux-i386 := -m32

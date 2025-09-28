@@ -42,49 +42,69 @@ jobs:
   release:
     runs-on: ubuntu-latest
     if: github.ref_type == 'tag'
-    
-    strategy:
-      matrix:
-        include:
-          # Linux x86_64
-          - target: linux-x86_64
-            cc: x86_64-linux-gnu-gcc
-            artifact_name: usbctl-linux-x86_64
-            
-          # Linux ARM64 (树莓派4等)
-          - target: linux-arm64
-            cc: aarch64-linux-gnu-gcc
-            artifact_name: usbctl-linux-arm64
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install build dependencies
+    - name: Install all cross-compilation dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential
         
-        # 安装交叉编译工具链
-        sudo apt-get install -y gcc-aarch64-linux-gnu gcc-multilib
-
-    - name: Check cross-compiler
-      run: |
-        command -v ${{ matrix.cc }} && echo "✓ ${{ matrix.cc }} found" || echo "✗ ${{ matrix.cc }} not found"
-
-    - name: Build ${{ matrix.target }}
-      run: |
-        # 使用 Makefile 中定义的目标构建
-        make ${{ matrix.target }}
+        # 安装所有可用的交叉编译工具链
+        sudo apt-get install -y \
+          gcc-aarch64-linux-gnu \
+          gcc-arm-linux-gnueabihf \
+          gcc-i686-linux-gnu \
+          gcc-mips-linux-gnu \
+          gcc-mipsel-linux-gnu \
+          gcc-mips64-linux-gnuabi64 \
+          gcc-mips64el-linux-gnuabi64 \
+          gcc-powerpc64le-linux-gnu \
+          gcc-riscv64-linux-gnu \
+          gcc-s390x-linux-gnu \
+          gcc-multilib
         
-        # 验证构建结果
-        ls -la build/
-        file build/${{ matrix.artifact_name }}
+        # 安装 MinGW 用于 Windows 交叉编译
+        sudo apt-get install -y \
+          gcc-mingw-w64-x86-64 \
+          gcc-mingw-w64-i686
 
-    - name: Upload artifacts
+    - name: Check available cross-compilers
+      run: |
+        make check-deps
+
+    - name: Build all targets and create distribution
+      run: |
+        # 使用 Makefile 的完整发布流程
+        make dist
+        make checksums
+        make package
+        
+        # 显示构建结果
+        echo "=== Built binaries ==="
+        ls -la build/
+        
+        echo "=== Distribution files ==="
+        ls -la dist/
+        
+        echo "=== Release packages ==="
+        ls -la dist/*.tar.gz dist/*.zip 2>/dev/null || true
+        
+        echo "=== Checksums ==="
+        cat dist/SHA256SUMS
+
+    - name: Upload individual binaries as artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ matrix.artifact_name }}
-        path: build/${{ matrix.artifact_name }}
+        name: binaries
+        path: build/usbctl-*
+
+    - name: Upload distribution files as artifacts  
+      uses: actions/upload-artifact@v4
+      with:
+        name: distribution
+        path: dist/*
 
   # 创建GitHub Release
   create-release:
@@ -106,11 +126,23 @@ jobs:
     - name: Prepare release files
       run: |
         mkdir -p release-files
-        find artifacts -name "usbctl-*" -type f -exec cp {} release-files/ \;
-        ls -la release-files/
         
-        # 复制安装脚本
-        cp install-service.sh release-files/
+        # 复制所有二进制文件
+        find artifacts/binaries -name "usbctl-*" -type f -exec cp {} release-files/ \; 2>/dev/null || true
+        
+        # 复制分发包
+        find artifacts/distribution -name "*.tar.gz" -o -name "*.zip" -exec cp {} release-files/ \; 2>/dev/null || true
+        
+        # 复制校验文件
+        cp artifacts/distribution/SHA256SUMS release-files/ 2>/dev/null || true
+        
+        # 复制安装脚本和文档
+        cp install-service.sh release-files/ 2>/dev/null || true
+        cp README.md release-files/ 2>/dev/null || true
+        cp LICENSE release-files/ 2>/dev/null || true
+        
+        echo "=== Release files ==="
+        ls -la release-files/
 
     - name: Create Release
       uses: softprops/action-gh-release@v1
@@ -125,44 +157,72 @@ jobs:
 
           ### 📦 支持的平台
 
-          | 平台 | 架构 | 文件名 | 适用设备 |
-          |------|------|--------|----------|
-          | 🐧 Linux | x86_64 | `usbctl-linux-x86_64` | PC服务器、普通电脑 |
-          | 🐧 Linux | ARM64 | `usbctl-linux-arm64` | 树莓派4、ARM64服务器 |
+          **Linux 架构支持：**
+          
+          | 架构 | 文件名 | 适用设备 |
+          |------|--------|----------|
+          | x86_64 | `usbctl-linux-x86_64` | PC服务器、普通电脑 |
+          | ARM64 | `usbctl-linux-arm64` | 树莓派4、ARM64服务器 |
+          | ARMv7 | `usbctl-linux-armv7` | 树莓派3、ARM32设备 |
+          | i386 | `usbctl-linux-i386` | 32位x86系统 |
+          | MIPS | `usbctl-linux-mips` | 路由器、嵌入式设备 |
+          | MIPS64 | `usbctl-linux-mips64` | 64位MIPS设备 |
+          | PowerPC64LE | `usbctl-linux-ppc64le` | IBM Power服务器 |
+          | RISC-V64 | `usbctl-linux-riscv64` | RISC-V开发板 |
+          | s390x | `usbctl-linux-s390x` | IBM Z系列大型机 |
+
+          **Windows 支持：**
+          
+          | 架构 | 文件名 | 适用系统 |
+          |------|--------|----------|
+          | x86_64 | `usbctl-windows-x86_64.exe` | 64位Windows |
+          | i386 | `usbctl-windows-i386.exe` | 32位Windows |
+
+          **打包下载：**
+          
+          - `usbctl-${{ github.ref_name }}-linux.tar.gz` - 所有Linux版本打包
+          - `usbctl-${{ github.ref_name }}-windows.zip` - 所有Windows版本打包
+          - `SHA256SUMS` - 校验和文件
 
           ### 🚀 快速安装
 
-          #### 方法1：自动安装（推荐）
+          #### 方法1：自动安装（推荐 - 仅Linux）
           
           ```bash
-          # 1. 下载并解压发布包
+          # 1. 下载对应架构的二进制文件和安装脚本
+          # 根据您的系统选择，例如 ARM64:
           wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/usbctl-linux-arm64
           wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/install-service.sh
           
           # 2. 准备安装
           mkdir -p build
-          mv usbctl-linux-arm64 build/usbctl  # 根据您的架构选择对应文件
+          mv usbctl-linux-arm64 build/usbctl  # 根据您的架构调整文件名
           chmod +x build/usbctl
           chmod +x install-service.sh
           
-          # 3. 安装服务
+          # 3. 一键安装服务
           sudo ./install-service.sh install
           ```
 
-          #### 方法2：手动安装
+          #### 方法2：使用打包文件
 
           ```bash
-          # 1. 下载对应架构的文件
-          wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/usbctl-linux-x86_64
+          # 下载Linux完整包
+          wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/usbctl-${{ github.ref_name }}-linux.tar.gz
+          tar -xzf usbctl-${{ github.ref_name }}-linux.tar.gz
           
-          # 2. 添加执行权限
-          chmod +x usbctl-linux-x86_64
-          
-          # 3. 安装到系统路径
+          # 选择对应架构的文件进行安装
+          chmod +x usbctl-linux-x86_64  # 示例：x86_64架构
           sudo cp usbctl-linux-x86_64 /usr/local/bin/usbctl
-          
-          # 4. 运行程序
-          usbctl --help
+          ```
+
+          #### 方法3：Windows 使用
+
+          ```cmd
+          # 下载 Windows 版本
+          # 下载 usbctl-windows-x86_64.exe
+          # 双击运行或在命令行中使用
+          usbctl-windows-x86_64.exe --help
           ```
 
           ### 💡 功能特性
@@ -172,20 +232,20 @@ jobs:
           - **🔧 嵌入式开发**：在开发板上透传USB调试设备
           - **🏠 智能家居**：树莓派作为USB设备服务器
           - **📱 Web管理界面**：通过浏览器管理USB设备
+          - **🌐 跨平台支持**：支持多种CPU架构和操作系统
 
           ### 📋 系统要求
 
-          **最低要求：**
-          - Linux 系统（推荐 Ubuntu 18.04+ 或 Debian 10+）
+          **Linux系统：**
           - 内核支持 usbip 模块
           - 管理员权限
-
-          **推荐环境：**
-          - 树莓派 4B (ARM64) 或 PC (x86_64)
-          - 2GB+ 内存
           - 网络连接
 
-          ### 🔧 依赖安装
+          **Windows系统：**
+          - Windows 7 及以上版本
+          - 管理员权限（访问USB设备）
+
+          ### 🔧 依赖安装（Linux）
 
           自动安装脚本会处理所有依赖，如需手动安装：
 
@@ -198,11 +258,20 @@ jobs:
           sudo modprobe usbip-host
           ```
 
+          ### 🔍 文件校验
+
+          所有文件的SHA256校验和请参考 `SHA256SUMS` 文件：
+
+          ```bash
+          # 校验下载的文件
+          sha256sum -c SHA256SUMS
+          ```
+
           ### 🌐 使用说明
 
           安装完成后，访问 Web 管理界面：
           ```
-          http://YOUR_PI_IP:11980
+          http://YOUR_DEVICE_IP:11980
           ```
 
           ### 📚 相关文档
@@ -211,19 +280,16 @@ jobs:
           - [🐛 问题反馈](https://github.com/${{ github.repository }}/issues)
           - [💬 讨论区](https://github.com/${{ github.repository }}/discussions)
 
-          ### 🔄 更新说明
-
-          完整的更新内容请查看下方的自动生成的发布说明。
-
           ### ⚠️ 注意事项
 
-          - 首次使用需要管理员权限安装 usbip 工具
+          - Linux首次使用需要管理员权限安装 usbip 工具
           - 确保防火墙开放 3240 和 11980 端口
           - 某些USB设备可能需要特定的内核模块
+          - Windows版本需要安装对应的USB驱动
 
           ### 🙏 致谢
 
-          感谢所有贡献者和测试用户的支持！特别感谢树莓派社区的反馈。
+          感谢所有贡献者和测试用户的支持！特别感谢嵌入式开发社区的反馈。
 
         files: release-files/*
       env:
