@@ -11,7 +11,7 @@ Architecture
 
 ## Project Overview
 
-**usbctl** is a lightweight, cross-platform USB/IP device management web interface, supporting both PC and mobile (responsive design). It integrates device listing, bind/unbind operations, real-time status push (SSE), operation logs, and is suitable for Linux (including Raspberry Pi), Windows (WSL/usbipd-win), and macOS.
+**usbctl** is a lightweight, cross-platform USB/IP device management web interface, supporting both PC and mobile (responsive design). It integrates device listing, bind/unbind operations, real-time status push (SSE), operation logs, and is suitable for Linux (including Raspberry Pi or Openwrt), Windows (WSL/usbipd-win), and macOS.
 
 - Single-file C implementation
 - Embedded HTML/CSS/JS resources, no external dependencies
