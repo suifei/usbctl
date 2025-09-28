@@ -50,25 +50,35 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential
-        
-        # 安装所有可用的交叉编译工具链
+
+        # 先尝试安装基础的交叉编译工具链（不包含冲突的包）
         sudo apt-get install -y \
           gcc-aarch64-linux-gnu \
           gcc-arm-linux-gnueabihf \
-          gcc-i686-linux-gnu \
+          gcc-powerpc64le-linux-gnu \
+          gcc-riscv64-linux-gnu \
+          gcc-s390x-linux-gnu || true
+
+        # 单独安装可能冲突的 MIPS 工具链
+        sudo apt-get install -y \
           gcc-mips-linux-gnu \
           gcc-mipsel-linux-gnu \
           gcc-mips64-linux-gnuabi64 \
-          gcc-mips64el-linux-gnuabi64 \
-          gcc-powerpc64le-linux-gnu \
-          gcc-riscv64-linux-gnu \
-          gcc-s390x-linux-gnu \
-          gcc-multilib
-        
+          gcc-mips64el-linux-gnuabi64 || true
+
         # 安装 MinGW 用于 Windows 交叉编译
         sudo apt-get install -y \
           gcc-mingw-w64-x86-64 \
-          gcc-mingw-w64-i686
+          gcc-mingw-w64-i686 || true
+
+        # 如果上述安装失败，尝试使用交叉编译包
+        if ! command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+          sudo apt-get install -y crossbuild-essential-arm64 || true
+        fi
+
+        if ! command -v arm-linux-gnueabihf-gcc >/dev/null 2>&1; then
+          sudo apt-get install -y crossbuild-essential-armhf || true
+        fi
 
     - name: Check available cross-compilers
       run: |
