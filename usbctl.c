@@ -637,7 +637,7 @@ void init_config()
              "%s\\AppData\\Local\\usbctl\\config", get_home_dir());
 #else
     snprintf(g_config.config_path, sizeof(g_config.config_path),
-             "%s/.config/usbctl/config", get_home_dir());
+             "/etc/usbctl/config");
 #endif
 }
 
