@@ -1002,6 +1002,7 @@ int bind_device(const char *busid)
     }
 
     char cmd[256];
+    char output[1024] = {0};
 #ifdef PLATFORM_WINDOWS
     // Windows: Try different usbipd-win commands
     snprintf(cmd, sizeof(cmd), "usbipd wsl attach --busid %s", busid);
@@ -1012,7 +1013,7 @@ int bind_device(const char *busid)
     
     log_message("INFO", "Attempting to bind device: %s", busid);
 
-    int result = exec_command(cmd, NULL, 0) == 0;
+    int result = (exec_command(cmd, output, sizeof(output)) == 0);
     if (result)
     {
         log_message("INFO", "Successfully bound device: %s", busid);
@@ -1546,6 +1547,7 @@ void *handle_client(void *arg)
                             log_message("INFO", "Successfully bound device: %s", busid_start);
                             // Update device list and generate response with devices
                             list_usbip_devices();
+                            save_config(); // 自动保存配置
                             char response_json[8192];
                             char devices_json[4096];
                             generate_devices_json(devices_json, sizeof(devices_json));
@@ -1594,6 +1596,7 @@ void *handle_client(void *arg)
                             log_message("INFO", "Successfully unbound device: %s", busid_start);
                             // Update device list and generate response with devices
                             list_usbip_devices();
+                            save_config(); // 自动保存配置
                             char response_json[8192];
                             char devices_json[4096];
                             generate_devices_json(devices_json, sizeof(devices_json));
@@ -1929,6 +1932,8 @@ int main(int argc, char *argv[])
 {
     init_config();
 
+    g_config.verbose_logging = 0;
+
     // Parse command line arguments first to check for immediate commands
     for (int i = 1; i < argc; i++)
     {
@@ -2079,6 +2084,7 @@ int main(int argc, char *argv[])
     // Restore bound devices from configuration (for system restart recovery)
     if (g_config.bound_devices_count > 0)
     {
+        log_message("INFO", "Restoring bound devices from configuration");
         restore_bound_devices();
         // Refresh device list to update bound states
         list_usbip_devices();

@@ -9,6 +9,7 @@ INSTALL_PATH="/usr/local/bin/usbctl"
 CONFIG_DIR="/etc/usbctl"
 LOG_FILE="/var/log/usbctl.log"
 SYSTEMD_SERVICE="/etc/systemd/system/${APP_NAME}.service"
+USBIPD_SERVICE="/etc/systemd/system/usbipd.service"  # 👈 新增
 MODULES_FILE="/etc/modules-load.d/usbip.conf"
 LOGROTATE_FILE="/etc/logrotate.d/usbctl"
 
@@ -77,20 +78,56 @@ setup_usbip_module() {
     log "Written $MODULES_FILE for auto-load on boot."
 }
 
-### 4. Start usbipd ###
-start_usbipd() {
-    if pgrep -x usbipd > /dev/null; then
-        log "usbipd is already running."
+### 创建 usbipd systemd 服务 ###
+create_usbipd_service() {
+    if [ -f "$USBIPD_SERVICE" ]; then
+        log "usbipd.service already exists, skipping creation."
         return
     fi
 
-    if systemctl list-unit-files | grep -q "^usbipd\.service"; then
-        log "Enable and start system usbipd.service"
-        systemctl enable --now usbipd
-    else
-        warn "usbipd.service not found, starting usbipd -D manually."
-        usbipd -D
+    # 自动查找 usbipd 路径（优先 /usr/sbin/）
+    USBIPD_BIN=""
+    for path in /usr/sbin/usbipd /usr/bin/usbipd /sbin/usbipd; do
+        if [ -x "$path" ]; then
+            USBIPD_BIN="$path"
+            break
+        fi
+    done
+
+    if [ -z "$USBIPD_BIN" ]; then
+        error "usbipd executable not found. Please install usbip package."
     fi
+
+    cat > "$USBIPD_SERVICE" <<EOF
+[Unit]
+Description=USB/IP Daemon
+After=network.target systemd-modules-load.service
+Before=usbctl.service
+
+[Service]
+Type=simple
+ExecStart=$USBIPD_BIN
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now usbipd
+    log "usbipd.service created with ExecStart=$USBIPD_BIN"
+}
+
+### 4. Start usbipd → 替换为依赖 systemd 服务 ###
+start_usbipd() {
+    # 不再手动启动，全部交由 systemd 管理
+    log "Ensuring usbipd.service is active..."
+    if ! systemctl is-active --quiet usbipd; then
+        systemctl start usbipd || error "Failed to start usbipd.service"
+    fi
+    log "usbipd is running via systemd."
 }
 
 ### 5. Firewall configuration ###
@@ -126,13 +163,14 @@ EOF
     fi
 }
 
-### 7. Create systemd service ###
+### 7. Create systemd service for usbctl → 添加对 usbipd.service 的依赖 ###
 create_systemd_service() {
     cat > "$SYSTEMD_SERVICE" <<EOF
 [Unit]
 Description=USB/IP Device Web Manager (usbctl)
 Documentation=https://github.com/suifei/usbctl
-After=network.target
+After=network.target usbipd.service
+Requires=usbipd.service
 
 [Service]
 Type=simple
@@ -154,6 +192,7 @@ EOF
     log "systemd service enabled and started."
 }
 
+
 ### 8. Setup logrotate ###
 setup_logrotate() {
     cat > "$LOGROTATE_FILE" <<EOF
@@ -170,10 +209,11 @@ EOF
     log "Configured logrotate: $LOGROTATE_FILE"
 }
 
-### 9. Uninstall ###
+### 9. Uninstall → 新增清理 usbipd.service ###
 uninstall() {
     log "Starting usbctl uninstall..."
 
+    # Stop and disable usbctl
     if systemctl is-active --quiet "$APP_NAME"; then
         systemctl stop "$APP_NAME"
     fi
@@ -182,36 +222,48 @@ uninstall() {
     fi
     rm -f "$SYSTEMD_SERVICE"
 
+    # Stop and disable usbipd (only if we created it)
+    if [ -f "$USBIPD_SERVICE" ]; then
+        if systemctl is-active --quiet usbipd; then
+            systemctl stop usbipd
+        fi
+        if systemctl is-enabled --quiet usbipd; then
+            systemctl disable usbipd
+        fi
+        rm -f "$USBIPD_SERVICE"
+        systemctl daemon-reload
+        log "Removed custom usbipd.service."
+    fi
+
     rm -f "$INSTALL_PATH"
-    # Optionally remove config directory
-    # rm -rf "$CONFIG_DIR"
+    # rm -rf "$CONFIG_DIR"  # 保留配置
     rm -f "$LOG_FILE"
     rm -f "$LOGROTATE_FILE"
     rm -f "$MODULES_FILE"
 
-    systemctl daemon-reload
     log "✅ usbctl uninstalled (config files remain in $CONFIG_DIR)"
 }
 
 ### MAIN FLOW ###
 case "${1:-install}" in
     install)
-    log "🚀 Starting usbctl deployment..."
-    check_port 11980
-    install_usbip
-    setup_usbip_module
-    start_usbipd
-    configure_firewall
-    install_binary
-    create_systemd_service
-    setup_logrotate
-    log "✅ Deployment complete! Visit http://$(hostname -I | awk '{print $1}'):11980"
+        log "🚀 Starting usbctl deployment..."
+        check_port 11980
+        install_usbip
+        setup_usbip_module
+        create_usbipd_service   # 👈 新增：创建服务
+        start_usbipd            # 👈 现在只是确保服务运行
+        configure_firewall
+        install_binary
+        create_systemd_service
+        setup_logrotate
+        log "✅ Deployment complete! Visit http://$(hostname -I | awk '{print $1}'):11980"
         ;;
     uninstall)
         uninstall
         ;;
     *)
-    echo "Usage: $0 [install|uninstall]"
-    exit 1
+        echo "Usage: $0 [install|uninstall]"
+        exit 1
         ;;
 esac
