@@ -1,91 +1,232 @@
-name: Release
+name: C/C++ CI and Release
 
 on:
   push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  # 当推送tag时触发发布
+  push:
     tags:
-      - 'v*'  # 当推送以 v 开头的 tag 时触发（如 v1.0.0, v2.1.0）
+      - 'v*'
+
+# 设置工作流权限
+permissions:
+  contents: write
 
 jobs:
-  create-release:
+  # 常规CI构建和测试
+  build:
     runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      release_id: ${{ steps.create_release.outputs.id }}
-    steps:
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref_name }}
-        release_name: Release ${{ github.ref_name }}
-        draft: false
-        prerelease: false
-        body: |
-          ## 更新内容
-          
-          详细更新内容请查看 [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md)
-          
-          ## 下载说明
-          
-          - **Linux (x64)**: `usbctl-linux-amd64`
-          - **Linux (ARM64)**: `usbctl-linux-arm64`
-          
-          ## 安装和使用
-          
-          1. 下载对应平台的可执行文件，并修改文件名 : `mkdir build && mv usbctl-linux-arm64 build/usbctl`
-          2. 给文件添加执行权限（Linux/macOS）: `chmod +x usbctl-*`
-          3. 查看使用帮助: `./usbctl-* --help`
-          4. 安装（确保 usbctl 在 build/usbctl 目录）：`chmod +x install-service.sh && ./install-service.sh install`
+    # 仅在非tag推送时运行
+    if: github.ref_type != 'tag'
 
-  build-and-upload:
-    needs: create-release
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential
+        sudo apt-get install -y gcc-aarch64-linux-gnu
+
+    - name: Build native
+      run: |
+        make native
+        ls -la build/
+
+    - name: Check build result
+      run: |
+        file build/usbctl
+        ./build/usbctl --help || true
+
+  # 发布构建 - 仅在推送tag时运行
+  release:
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag'
+    
     strategy:
       matrix:
         include:
-          # Linux 构建
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            binary_suffix: ""
-            artifact_name: usbctl-linux-amd64
-          - os: ubuntu-latest
-            goos: linux
-            goarch: arm64
-            binary_suffix: ""
-            artifact_name: usbctl-linux-arm64
+          # Linux x86_64
+          - target: linux-x86_64
+            cc: x86_64-linux-gnu-gcc
+            artifact_name: usbctl-linux-x86_64
             
-    runs-on: ${{ matrix.os }}
-    
+          # Linux ARM64 (树莓派4等)
+          - target: linux-arm64
+            cc: aarch64-linux-gnu-gcc
+            artifact_name: usbctl-linux-arm64
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential
+        
+        # 安装交叉编译工具链
+        sudo apt-get install -y gcc-aarch64-linux-gnu gcc-multilib
+
+    - name: Check cross-compiler
+      run: |
+        command -v ${{ matrix.cc }} && echo "✓ ${{ matrix.cc }} found" || echo "✗ ${{ matrix.cc }} not found"
+
+    - name: Build ${{ matrix.target }}
+      run: |
+        # 使用 Makefile 中定义的目标构建
+        make ${{ matrix.target }}
+        
+        # 验证构建结果
+        ls -la build/
+        file build/${{ matrix.artifact_name }}
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}
+        path: build/${{ matrix.artifact_name }}
+
+  # 创建GitHub Release
+  create-release:
+    needs: release
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    # 如果是 C/C++ 项目，取消注释以下部分
-    - name: Install build dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential gcc-multilib
-        # 如果需要交叉编译工具链，可以添加：
-        sudo apt-get install -y gcc-aarch64-linux-gnu gcc-mingw-w64
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
 
-    # 根据您的 Makefile 调整构建命令
-    - name: Build binary
+    - name: Prepare release files
       run: |
-        make ${{ matrix.artifact_name }}
+        mkdir -p release-files
+        find artifacts -name "usbctl-*" -type f -exec cp {} release-files/ \;
+        ls -la release-files/
         
-        # 确保二进制文件存在
-        ls -la ${{ matrix.artifact_name }}
+        # 复制安装脚本
+        cp install-service.sh release-files/
 
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ github.ref_name }}
+        name: usbctl ${{ github.ref_name }}
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+        body: |
+          ## 🎉 USB透传工具 ${{ github.ref_name }} 发布
+
+          ### 📦 支持的平台
+
+          | 平台 | 架构 | 文件名 | 适用设备 |
+          |------|------|--------|----------|
+          | 🐧 Linux | x86_64 | `usbctl-linux-x86_64` | PC服务器、普通电脑 |
+          | 🐧 Linux | ARM64 | `usbctl-linux-arm64` | 树莓派4、ARM64服务器 |
+
+          ### 🚀 快速安装
+
+          #### 方法1：自动安装（推荐）
+          
+          ```bash
+          # 1. 下载并解压发布包
+          wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/usbctl-linux-arm64
+          wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/install-service.sh
+          
+          # 2. 准备安装
+          mkdir -p build
+          mv usbctl-linux-arm64 build/usbctl  # 根据您的架构选择对应文件
+          chmod +x build/usbctl
+          chmod +x install-service.sh
+          
+          # 3. 安装服务
+          sudo ./install-service.sh install
+          ```
+
+          #### 方法2：手动安装
+
+          ```bash
+          # 1. 下载对应架构的文件
+          wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/usbctl-linux-x86_64
+          
+          # 2. 添加执行权限
+          chmod +x usbctl-linux-x86_64
+          
+          # 3. 安装到系统路径
+          sudo cp usbctl-linux-x86_64 /usr/local/bin/usbctl
+          
+          # 4. 运行程序
+          usbctl --help
+          ```
+
+          ### 💡 功能特性
+
+          - **🔌 USB设备网络透传**：让远程设备访问本地USB设备
+          - **🖱️ 无线化有线设备**：将复杂的有线键鼠改为无线使用  
+          - **🔧 嵌入式开发**：在开发板上透传USB调试设备
+          - **🏠 智能家居**：树莓派作为USB设备服务器
+          - **📱 Web管理界面**：通过浏览器管理USB设备
+
+          ### 📋 系统要求
+
+          **最低要求：**
+          - Linux 系统（推荐 Ubuntu 18.04+ 或 Debian 10+）
+          - 内核支持 usbip 模块
+          - 管理员权限
+
+          **推荐环境：**
+          - 树莓派 4B (ARM64) 或 PC (x86_64)
+          - 2GB+ 内存
+          - 网络连接
+
+          ### 🔧 依赖安装
+
+          自动安装脚本会处理所有依赖，如需手动安装：
+
+          ```bash
+          # Ubuntu/Debian
+          sudo apt-get update
+          sudo apt-get install usbip linux-tools-generic
+          
+          # 加载内核模块
+          sudo modprobe usbip-host
+          ```
+
+          ### 🌐 使用说明
+
+          安装完成后，访问 Web 管理界面：
+          ```
+          http://YOUR_PI_IP:11980
+          ```
+
+          ### 📚 相关文档
+
+          - [📖 详细文档](https://github.com/${{ github.repository }}/blob/main/README.md)
+          - [🐛 问题反馈](https://github.com/${{ github.repository }}/issues)
+          - [💬 讨论区](https://github.com/${{ github.repository }}/discussions)
+
+          ### 🔄 更新说明
+
+          完整的更新内容请查看下方的自动生成的发布说明。
+
+          ### ⚠️ 注意事项
+
+          - 首次使用需要管理员权限安装 usbip 工具
+          - 确保防火墙开放 3240 和 11980 端口
+          - 某些USB设备可能需要特定的内核模块
+
+          ### 🙏 致谢
+
+          感谢所有贡献者和测试用户的支持！特别感谢树莓派社区的反馈。
+
+        files: release-files/*
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ needs.create-release.outputs.upload_url }}
-        asset_path: ./${{ matrix.artifact_name }}
-        asset_name: ${{ matrix.artifact_name }}
-        asset_content_type: application/octet-stream
-
-    #     asset_content_type: application/vnd.debian.binary-package
