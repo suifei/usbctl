@@ -3,6 +3,10 @@ English | [中文](README.md)
 
 # usbctl - USB/IP Device Web Manager
 
+Architecture
+
+![architecture](./architecture.svg)
+
 ![usbctl responsive UI screenshot](usbctl.jpg)
 
 ## Project Overview
