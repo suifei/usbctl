@@ -5,7 +5,7 @@ English | [中文](README.md)
 
 Architecture
 
-![architecture](./architecture.svg)
+![architecture](./architecture_en.svg)
 
 ![usbctl responsive UI screenshot](usbctl.jpg)
 
