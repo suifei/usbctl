@@ -1339,9 +1339,11 @@ void *device_poll_thread(void *arg)
 
     while (g_running)
     {
-        // Save previous state
+        // Save previous state with lock
+        pthread_mutex_lock(&g_mutex);
         memcpy(prev_devices, g_devices, sizeof(prev_devices));
         prev_count = g_device_count;
+        pthread_mutex_unlock(&g_mutex);
 
         // Update device list
         list_usbip_devices();
