@@ -154,7 +154,7 @@ install_binary() {
 port=11980
 bind=0.0.0.0
 poll_interval=3
-verbose_logging=1
+verbose_logging=0
 log_file=/var/log/usbctl.log
 EOF
         chown root:root "$CONFIG_DIR/config"

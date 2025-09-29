@@ -11,72 +11,73 @@
  * - ARM Linux optimized
  *
  * Build: gcc -static -O2 -o usbctl usbctl.c -lpthread
- * Usage: ./usbctl [options]
+ * Usage: sudo ./usbctl [options]
  */
 
 // Platform detection
 #ifdef _WIN32
-    #define PLATFORM_WINDOWS
-    #ifndef WIN32_LEAN_AND_MEAN
-        #define WIN32_LEAN_AND_MEAN
-    #endif
-    #include <windows.h>
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #include <io.h>
-    #include <direct.h>
-    #ifdef _MSC_VER
-        #pragma comment(lib, "ws2_32.lib")
-        #pragma comment(lib, "pthread")
-    #endif
-    // Windows socket compatibility
-    #define close(s) closesocket(s)
-    #define ssize_t int
-    #define sleep(x) Sleep(x * 1000)
-    #define popen(cmd, mode) _popen(cmd, mode)
-    #define pclose(fp) _pclose(fp)
-    #define mkdir(path, mode) _mkdir(path)
-    #define PATH_SEPARATOR "\\"
-    // Windows-specific missing definitions
-    #define MSG_NOSIGNAL 0
-    #define SIGPIPE 13
-    #define WEXITSTATUS(w) (((w) >> 8) & 0xff)
-    // Signal handling compatibility
-    struct sigaction {
-        void (*sa_handler)(int);
-        int sa_flags;
-        int sa_mask;
-    };
-    #define sigemptyset(set) (*(set) = 0)
-    #define sigaction(sig, act, oact) signal(sig, (act)->sa_handler)
+#define PLATFORM_WINDOWS
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <direct.h>
+#include <io.h>
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "pthread")
+#endif
+// Windows socket compatibility
+#define close(s) closesocket(s)
+#define ssize_t int
+#define sleep(x) Sleep(x * 1000)
+#define popen(cmd, mode) _popen(cmd, mode)
+#define pclose(fp) _pclose(fp)
+#define mkdir(path, mode) _mkdir(path)
+#define PATH_SEPARATOR "\\"
+// Windows-specific missing definitions
+#define MSG_NOSIGNAL 0
+#define SIGPIPE 13
+#define WEXITSTATUS(w) (((w) >> 8) & 0xff)
+// Signal handling compatibility
+struct sigaction
+{
+    void (*sa_handler)(int);
+    int sa_flags;
+    int sa_mask;
+};
+#define sigemptyset(set) (*(set) = 0)
+#define sigaction(sig, act, oact) signal(sig, (act)->sa_handler)
 #else
-    #define PLATFORM_UNIX
-    // Enable POSIX/GNU extensions for readlink and others before any headers
-    #ifndef _GNU_SOURCE
-    #define _GNU_SOURCE
-    #endif
-    #include <unistd.h>
-    #include <sys/time.h>
-    #include <sys/select.h>
-    #include <sys/wait.h>
-    #include <sys/socket.h>
-    #include <sys/stat.h>
-    #include <netinet/in.h>
-    #include <arpa/inet.h>
-    #include <dirent.h>
-    #define PATH_SEPARATOR "/"
+#define PLATFORM_UNIX
+// Enable POSIX/GNU extensions for readlink and others before any headers
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#define PATH_SEPARATOR "/"
 #endif
 
 // Common headers
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
-#include <signal.h>
-#include <errno.h>
 #include <time.h>
-#include <fcntl.h>
-#include <stdarg.h>
 
 #define VERSION "1.0.0"
 #define AUTHOR "github.com/suifei"
@@ -86,6 +87,7 @@
 #define BUFFER_SIZE 8192
 #define CONFIG_PATH_SIZE 512
 #define MAX_DEVICES 32
+#define MAX_LSUSB_ENTRIES 64
 #define LOG_BUFFER_SIZE 1024
 
 // Configuration structure
@@ -109,7 +111,8 @@ int unbind_device(const char *busid);
 int exec_command(const char *cmd, char *output, size_t output_size);
 
 // HTTP响应函数声明
-void send_http_response(int client_socket, int status_code, const char *status_text, const char *content_type, const char *body);
+void send_http_response(int client_socket, int status_code, const char *status_text, const char *content_type,
+                        const char *body);
 
 // USB device structure
 typedef struct
@@ -118,7 +121,12 @@ typedef struct
     char info[256];
     int bound;
 } usb_device_t;
-
+// Structure to map USB VID:PID to human-readable description
+typedef struct
+{
+    char id[16];    // e.g., "303a:1001"
+    char desc[256]; // e.g., "Espressif USB JTAG/serial debug unit"
+} lsusb_entry_t;
 // SSE client structure
 typedef struct
 {
@@ -131,6 +139,10 @@ typedef struct
 // Global variables
 static config_t g_config = {DEFAULT_PORT, DEFAULT_BIND, 3, "", 1, "/var/log/usbctl.log", {""}, 0};
 static usb_device_t g_devices[MAX_DEVICES];
+// Global cache for lsusb data
+static lsusb_entry_t g_lsusb_map[MAX_LSUSB_ENTRIES];
+static int g_lsusb_count = 0;
+
 static int g_device_count = 0;
 static client_t g_clients[MAX_CLIENTS];
 static int g_client_count = 0;
@@ -145,234 +157,342 @@ static int g_usbip_error_shown = 0;
 // ============================================================================
 
 // Embedded Logo SVG
-const char *LOGO_SVG =
-    "<svg width=\"64\" height=\"64\" viewBox=\"0 0 64 64\" xmlns=\"http://www.w3.org/2000/svg\">"
-    "<rect x=\"12\" y=\"24\" width=\"24\" height=\"16\" rx=\"2\" fill=\"#007BFF\" stroke=\"#0056b3\" stroke-width=\"2\"/>"
-    "<rect x=\"36\" y=\"28\" width=\"4\" height=\"2\" fill=\"#fff\"/>"
-    "<rect x=\"36\" y=\"32\" width=\"4\" height=\"2\" fill=\"#fff\"/>"
-    "<path d=\"M40 32 L52 32\" stroke=\"#007BFF\" stroke-width=\"3\" stroke-linecap=\"round\"/>"
-    "<circle cx=\"52\" cy=\"32\" r=\"6\" fill=\"#28a745\" stroke=\"#1e7e34\" stroke-width=\"2\"/>"
-    "<circle cx=\"52\" cy=\"32\" r=\"2\" fill=\"#fff\"/>"
-    "</svg>";
+const char *LOGO_SVG = "<svg width=\"64\" height=\"64\" viewBox=\"0 0 64 64\" "
+                       "xmlns=\"http://www.w3.org/2000/svg\">"
+                       "<rect x=\"12\" y=\"24\" width=\"24\" height=\"16\" rx=\"2\" "
+                       "fill=\"#007BFF\" stroke=\"#0056b3\" stroke-width=\"2\"/>"
+                       "<rect x=\"36\" y=\"28\" width=\"4\" height=\"2\" fill=\"#fff\"/>"
+                       "<rect x=\"36\" y=\"32\" width=\"4\" height=\"2\" fill=\"#fff\"/>"
+                       "<path d=\"M40 32 L52 32\" stroke=\"#007BFF\" stroke-width=\"3\" "
+                       "stroke-linecap=\"round\"/>"
+                       "<circle cx=\"52\" cy=\"32\" r=\"6\" fill=\"#28a745\" "
+                       "stroke=\"#1e7e34\" "
+                       "stroke-width=\"2\"/>"
+                       "<circle cx=\"52\" cy=\"32\" r=\"2\" fill=\"#fff\"/>"
+                       "</svg>";
 
-// Embedded favicon.ico (base64 encoded 16x16 USB connector icon - blue and green design like SVG logo)
-static const char *EMBEDDED_FAVICON =
-    "AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAAAQAABILAAASCwAAAAAAAAAAAAD"
-    "///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A"
-    "////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP"
-    "///wD///8A////AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///wD/"
-    "//8A////AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///wD///8A///"
-    "/AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///wD///8A////AP//"
-    "/wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///wD///8A////AP///wAH"
-    "tP8AB7T/AAe0/wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///wAHtP8A"
-    "B7T/AAe0/wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///wD///8A////"
-    "AP///wD///8A////AP///wAoqAAAs+0AAP///wD///8A////AP///wD///8A////AP///wD///8A////AP//"
-    "/wD///8A////ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD/"
-    "//8A////ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A"
-    "////ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A///"
-    "/ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////A"
-    "CoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////ACo"
-    "qKgAoqAAA////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///"
-    "wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8AAAAAAAAAAAAA"
-    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+// Embedded favicon.ico (base64 encoded 16x16 USB connector icon - blue and
+// green design like SVG logo)
+static const char *EMBEDDED_FAVICON = "AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAAAQAABILAAASCwA"
+                                      "AAA"
+                                      "AAAAAAAAD"
+                                      "///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A//"
+                                      "//"
+                                      "AP///wD///8A"
+                                      "////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP/"
+                                      "//"
+                                      "wD///8A////AP"
+                                      "///wD///8A////AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD//"
+                                      "/"
+                                      "8A////AP///wD/"
+                                      "//8A////AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A///"
+                                      "/"
+                                      "AP///wD///8A///"
+                                      "/AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///"
+                                      "wD//"
+                                      "/8A////AP//"
+                                      "/wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///wD///"
+                                      "8A//"
+                                      "//AP///wAH"
+                                      "tP8AB7T/AAe0/wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A///"
+                                      "/"
+                                      "AP///wAHtP8A"
+                                      "B7T/AAe0/wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP/"
+                                      "//"
+                                      "wD///8A////"
+                                      "AP///wD///8A////AP///wAoqAAAs+0AAP///wD///8A////AP///wD///8A////AP///"
+                                      "wD///"
+                                      "8A////AP//"
+                                      "/wD///8A////ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///"
+                                      "8A//"
+                                      "//AP///wD/"
+                                      "//8A////ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A///"
+                                      "/"
+                                      "AP///wD///8A"
+                                      "////ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP/"
+                                      "//"
+                                      "wD///8A///"
+                                      "/ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///"
+                                      "wD//"
+                                      "/8A////A"
+                                      "CoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD/"
+                                      "//"
+                                      "8A////ACo"
+                                      "qKgAoqAAA////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///"
+                                      "8A/"
+                                      "///AP///"
+                                      "wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///"
+                                      "8AAAAAAAAAAAAA"
+                                      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                                      "AAA"
+                                      "AA=";
 
 // Embedded CSS (Ultra-compact responsive design with modern aesthetics)
-static const char *EMBEDDED_CSS =
-    "*{margin:0;padding:0;box-sizing:border-box}"
-    "body{font:14px/1.4 system-ui,-apple-system,sans-serif;background:#f8f9fa;color:#333;padding:10px;padding-bottom:220px}"
-    "header{text-align:center;margin-bottom:20px;padding:10px;background:linear-gradient(135deg,#007bff,#6610f2);color:#fff;border-radius:8px}"
-    ".logo{width:32px;height:32px;margin:0 8px;vertical-align:middle}"
-    "h1{font-size:24px;margin:5px 0}"
-    ".controls{text-align:center;margin-bottom:15px}"
-    ".lang-btn{background:#28a745;color:#fff;border:none;padding:4px 8px;border-radius:4px;margin:0 2px;cursor:pointer;font-size:11px}"
-    ".lang-btn.active{background:#155724}"
-    ".main-content{margin-bottom:20px}"
-    "table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1)}"
-    "th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #dee2e6;font-size:13px}"
-    "th{background:#007bff;color:#fff;font-weight:600;position:sticky;top:0}"
-    "tr:hover{background:#f8f9fa}"
-    ".status{font-weight:600;padding:2px 6px;border-radius:3px;font-size:11px}"
-    ".bound{background:#d4edda;color:#155724}"
-    ".unbound{background:#f8d7da;color:#721c24}"
-    "button{padding:4px 8px;border:none;border-radius:3px;cursor:pointer;font-size:11px;transition:all 0.2s}"
-    ".btn-bind{background:#28a745;color:#fff}"
-    ".btn-unbind{background:#dc3545;color:#fff}"
-    ".btn-bind:hover{background:#218838}"
-    ".btn-unbind:hover{background:#c82333}"
-    "#status{position:fixed;top:10px;right:10px;padding:4px 8px;background:#17a2b8;color:#fff;border-radius:4px;font-size:11px;z-index:1000}"
-    ".footer{position:fixed;bottom:0;left:0;right:0;text-align:center;font-size:11px;color:#6c757d;background:rgba(248,249,250,0.98);padding:8px 15px;border-top:1px solid #dee2e6;backdrop-filter:blur(10px);z-index:999}"
-    ".footer a{color:#007bff;text-decoration:none}"
-    ".log-container{position:fixed;bottom:40px;left:0;right:0;height:150px;background:#fff;border-top:2px solid #007bff;box-shadow:0 -2px 10px rgba(0,0,0,0.1);z-index:998}"
-    ".log-header{display:flex;justify-content:space-between;align-items:center;padding:8px 15px;background:#f8f9fa;border-bottom:1px solid #dee2e6}"
-    ".log-title{font-weight:600;color:#333;font-size:13px}"
-    ".clear-log-btn{background:#6c757d;color:#fff;padding:3px 8px;border:none;border-radius:3px;cursor:pointer;font-size:11px}"
-    ".clear-log-btn:hover{background:#5a6268}"
-    ".log-content{height:calc(150px - 40px);overflow-y:auto;padding:8px;font-family:monospace;font-size:12px;line-height:1.3}"
-    ".log-entry{margin-bottom:4px;padding:2px 0;border-left:3px solid transparent;padding-left:8px}"
-    ".log-success{color:#155724;border-left-color:#28a745;background:#d4edda}"
-    ".log-error{color:#721c24;border-left-color:#dc3545;background:#f8d7da}"
-    ".log-info{color:#0c5460;border-left-color:#17a2b8;background:#d1ecf1}"
-    ".log-timestamp{color:#6c757d;font-size:10px}"
-    "@media(max-width:768px){"
-    "body{padding:5px;padding-bottom:200px}"
-    "h1{font-size:20px}"
-    "th,td{padding:6px 8px;font-size:12px}"
-    "button{padding:3px 6px;font-size:10px}"
-    ".logo{width:24px;height:24px}"
-    ".controls{margin-bottom:10px}"
-    ".footer{padding:6px 10px;font-size:10px}"
-    ".log-container{height:130px;bottom:35px}"
-    ".log-content{height:calc(130px - 35px);font-size:11px}"
-    ".log-header{padding:6px 12px}"
-    ".log-title{font-size:12px}"
-    "}";
+static const char *EMBEDDED_CSS = "*{margin:0;padding:0;box-sizing:border-box}"
+                                  "body{font:14px/1.4 "
+                                  "system-ui,-apple-system,sans-serif;background:#f8f9fa;color:#333;"
+                                  "padding:"
+                                  "10px;padding-bottom:220px}"
+                                  "header{text-align:center;margin-bottom:20px;padding:10px;background:"
+                                  "linear-gradient(135deg,#007bff,#6610f2);color:#fff;border-radius:8px}"
+                                  ".logo{width:32px;height:32px;margin:0 8px;vertical-align:middle}"
+                                  "h1{font-size:24px;margin:5px 0}"
+                                  ".controls{text-align:center;margin-bottom:15px}"
+                                  ".lang-btn{background:#28a745;color:#fff;border:none;padding:4px "
+                                  "8px;border-radius:4px;margin:0 2px;cursor:pointer;font-size:11px}"
+                                  ".lang-btn.active{background:#155724}"
+                                  ".main-content{margin-bottom:20px}"
+                                  "table{width:100%;border-collapse:collapse;background:#fff;border-"
+                                  "radius:"
+                                  "8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1)}"
+                                  "th,td{padding:8px 12px;text-align:left;border-bottom:1px solid "
+                                  "#dee2e6;font-size:13px}"
+                                  "th{background:#007bff;color:#fff;font-weight:600;position:sticky;top:0}"
+                                  "tr:hover{background:#f8f9fa}"
+                                  ".status{font-weight:600;padding:2px "
+                                  "6px;border-radius:3px;font-size:11px}"
+                                  ".bound{background:#d4edda;color:#155724}"
+                                  ".unbound{background:#f8d7da;color:#721c24}"
+                                  "button{padding:4px "
+                                  "8px;border:none;border-radius:3px;cursor:pointer;font-size:11px;"
+                                  "transition:all 0.2s}"
+                                  ".btn-bind{background:#28a745;color:#fff}"
+                                  ".btn-unbind{background:#dc3545;color:#fff}"
+                                  ".btn-bind:hover{background:#218838}"
+                                  ".btn-unbind:hover{background:#c82333}"
+                                  "#status{position:fixed;top:10px;right:10px;padding:4px "
+                                  "8px;background:#17a2b8;color:#fff;border-radius:4px;font-size:11px;z-"
+                                  "index:1000}"
+                                  ".footer{position:fixed;bottom:0;left:0;right:0;text-align:center;font-"
+                                  "size:11px;color:#6c757d;background:rgba(248,249,250,0.98);padding:8px "
+                                  "15px;border-top:1px solid "
+                                  "#dee2e6;backdrop-filter:blur(10px);z-index:999}"
+                                  ".footer a{color:#007bff;text-decoration:none}"
+                                  ".log-container{position:fixed;bottom:40px;left:0;right:0;height:150px;"
+                                  "background:#fff;border-top:2px solid #007bff;box-shadow:0 -2px 10px "
+                                  "rgba(0,0,0,0.1);z-index:998}"
+                                  ".log-header{display:flex;justify-content:space-between;align-items:"
+                                  "center;"
+                                  "padding:8px 15px;background:#f8f9fa;border-bottom:1px solid #dee2e6}"
+                                  ".log-title{font-weight:600;color:#333;font-size:13px}"
+                                  ".clear-log-btn{background:#6c757d;color:#fff;padding:3px "
+                                  "8px;border:none;border-radius:3px;cursor:pointer;font-size:11px}"
+                                  ".clear-log-btn:hover{background:#5a6268}"
+                                  ".log-content{height:calc(150px - "
+                                  "40px);overflow-y:auto;padding:8px;font-family:monospace;font-size:12px;"
+                                  "line-height:1.3}"
+                                  ".log-entry{margin-bottom:4px;padding:2px 0;border-left:3px solid "
+                                  "transparent;padding-left:8px}"
+                                  ".log-success{color:#155724;border-left-color:#28a745;background:#"
+                                  "d4edda}"
+                                  ".log-error{color:#721c24;border-left-color:#dc3545;background:#f8d7da}"
+                                  ".log-info{color:#0c5460;border-left-color:#17a2b8;background:#d1ecf1}"
+                                  ".log-timestamp{color:#6c757d;font-size:10px}"
+                                  "@media(max-width:768px){"
+                                  "body{padding:5px;padding-bottom:200px}"
+                                  "h1{font-size:20px}"
+                                  "th,td{padding:6px 8px;font-size:12px}"
+                                  "button{padding:3px 6px;font-size:10px}"
+                                  ".logo{width:24px;height:24px}"
+                                  ".controls{margin-bottom:10px}"
+                                  ".footer{padding:6px 10px;font-size:10px}"
+                                  ".log-container{height:130px;bottom:35px}"
+                                  ".log-content{height:calc(130px - 35px);font-size:11px}"
+                                  ".log-header{padding:6px 12px}"
+                                  ".log-title{font-size:12px}"
+                                  "}";
 
 // Embedded JavaScript (Ultra-optimized with smart i18n)
-const char *EMBEDDED_JS =
-    "let eventSource,devices=[],lang='en',logEntries=[];"
-    "const i18n={'en':{'title':'USB/IP Manager','device':'Device Info','busid':'Bus ID','status':'Status','action':'Action','bound':'Bound','unbound':'Unbound','bind':'Bind','unbind':'Unbind','connected':'Connected','disconnected':'Disconnected','error':'Error','author':'Author','log_title':'Operation Log','clear':'Clear','bind_success':'Device {busid} bound successfully','unbind_success':'Device {busid} unbound successfully','bind_error':'Error binding device {busid}: {error}','unbind_error':'Error unbinding device {busid}: {error}'},'zh':{'title':'USB/IP 管理器','device':'设备信息','busid':'总线ID','status':'状态','action':'操作','bound':'已绑定','unbound':'未绑定','bind':'绑定','unbind':'解绑','connected':'已连接','disconnected':'已断开','error':'错误','author':'作者','log_title':'操作日志','clear':'清除','bind_success':'设备 {busid} 绑定成功','unbind_success':'设备 {busid} 解绑成功','bind_error':'绑定设备 {busid} 失败: {error}','unbind_error':'解绑设备 {busid} 失败: {error}'}};"
-    "function detectLang(){"
-    "try{"
-    "const stored=localStorage.getItem('usbctl_lang');"
-    "if(stored&&i18n[stored])return stored;"
-    "const nav=navigator.language||navigator.userLanguage||navigator.browserLanguage||'en';"
-    "const langCode=nav.toLowerCase();"
-    "if(langCode.startsWith('zh')||langCode.includes('chinese')||langCode.includes('cn'))return 'zh';"
-    "return 'en';"
-    "}catch(e){return 'en';}"
-    "}"
-    "function t(k,vars){let text=i18n[lang][k]||k;if(vars){Object.keys(vars).forEach(key=>{text=text.replace(`{${key}}`,vars[key]);})}return text;}"
-    "function setLang(l){lang=l;localStorage.setItem('usbctl_lang',l);updateUI();}"
-    "function updateUI(){"
-    "document.title=`usbctl - ${t('title')}`;"
-    "document.querySelector('h1').textContent=t('title');"
-    "document.documentElement.lang=lang==='zh'?'zh-CN':'en';"
-    "const ths=document.querySelectorAll('th');"
-    "if(ths.length>=4){ths[0].textContent=t('device');ths[1].textContent=t('busid');ths[2].textContent=t('status');ths[3].textContent=t('action');}"
-    "document.querySelectorAll('.lang-btn').forEach(b=>b.classList.toggle('active',b.dataset.lang===lang));"
-    "const logTitle=document.querySelector('.log-title');"
-    "if(logTitle)logTitle.textContent=t('log_title');"
-    "const clearBtn=document.querySelector('.clear-log-btn');"
-    "if(clearBtn)clearBtn.textContent=t('clear');"
-    "render();renderLog();"
-    "}"
-    "function connectSSE(){"
-    "if(eventSource)eventSource.close();"
-    "eventSource=new EventSource('/events');"
-    "eventSource.onopen=()=>document.getElementById('status').textContent=t('connected');"
-    "eventSource.onmessage=e=>{"
-    "try{devices=JSON.parse(e.data);render();}catch(err){console.error(err);}"
-    "};"
-    "eventSource.onerror=()=>{"
-    "document.getElementById('status').textContent=t('disconnected');"
-    "setTimeout(connectSSE,3000);"
-    "};"
-    "}"
-    "function render(){"
-    "const tbody=document.querySelector('tbody');"
-    "tbody.innerHTML=devices.map(d=>"
-    "`<tr><td>${d.info}</td><td><code>${d.busid}</code></td>`+"
-    "`<td><span class=\"status ${d.bound?'bound':'unbound'}\">${t(d.bound?'bound':'unbound')}</span></td>`+"
-    "`<td><button class=\"${d.bound?'btn-unbind':'btn-bind'}\" onclick=\"toggle('${d.busid}')\">`+"
-    "`${t(d.bound?'unbind':'bind')}</button></td></tr>`).join('');"
-    "}"
-    "function addLog(type,message){"
-    "const timestamp=new Date().toLocaleTimeString();"
-    "const entry={type,message,timestamp};"
-    "logEntries.unshift(entry);"
-    "if(logEntries.length>100)logEntries.pop();"
-    "renderLog();"
-    "}"
-    "function renderLog(){"
-    "const logContent=document.getElementById('logContent');"
-    "if(!logContent)return;"
-    "logContent.innerHTML=logEntries.map(entry=>"
-    "`<div class=\"log-entry log-${entry.type}\">`+"
-    "`<span class=\"log-timestamp\">[${entry.timestamp}]</span> ${entry.message}`+"
-    "`</div>`).join('');"
-    "logContent.scrollTop=0;"
-    "}"
-    "function clearLog(){"
-    "logEntries=[];"
-    "renderLog();"
-    "}"
-    "function toggle(busid){"
-    "const device=devices.find(d=>d.busid===busid);"
-    "if(!device)return;"
-    "const button=event.target;"
-    "const action=device.bound?'unbind':'bind';"
-    "button.disabled=true;"
-    "fetch(`/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},"
-    "body:JSON.stringify({busid})})"
-    ".then(response=>{"
-    "if(response.ok){"
-    "return response.json().then(data=>{"
-    "addLog('success',t(`${action}_success`,{busid}));"
-    "if(data.devices){"
-    "devices=data.devices;"
-    "render();"
-    "}else{"
-    "loadDevices();"
-    "}"
-    "});"
-    "}else{"
-    "return response.text().then(text=>{"
-    "let errorMsg='Unknown error';"
-    "try{"
-    "const data=JSON.parse(text);"
-    "if(data.error){"
-    "errorMsg=data.error.trim();"
-    "const errorMatch=errorMsg.match(/error[:\\s]*(.+?)(?:\\n|$)/i);"
-    "if(errorMatch)errorMsg=errorMatch[1];"
-    "}"
-    "}catch(e){"
-    "const errorMatch=text.match(/error[:\\s]*(.+?)(?:\\n|$)/i);"
-    "if(errorMatch)errorMsg=errorMatch[1];"
-    "}"
-    "addLog('error',t(`${action}_error`,{busid,error:errorMsg}));"
-    "throw new Error(errorMsg);"
-    "});"
-    "}"
-    "})"
-    ".catch(err=>{"
-    "console.error(err);"
-    "})"
-    ".finally(()=>button.disabled=false);"
-    "}"
-    "function loadDevices(){"
-    "fetch('/api/devices').then(r=>r.json()).then(data=>{devices=data;render()}).catch(console.error);"
-    "}"
-    "window.onload=()=>{"
-    "lang=detectLang();"
-    "updateUI();connectSSE();loadDevices();"
-    "};";
+const char *EMBEDDED_JS = "let eventSource,devices=[],lang='en',logEntries=[];"
+                          "const i18n={'en':{'title':'USB/IP Manager','device':'Device "
+                          "Info','busid':'Bus "
+                          "ID','status':'Status','action':'Action','bound':'Bound','unbound':'"
+                          "Unbound','bind':'Bind','unbind':'Unbind','connected':'Connected','"
+                          "disconnected':'Disconnected','error':'Error','author':'Author','log_"
+                          "title'"
+                          ":'Operation Log','clear':'Clear','bind_success':'Device {busid} bound "
+                          "successfully','unbind_success':'Device {busid} unbound "
+                          "successfully','bind_error':'Error binding device {busid}: "
+                          "{error}','unbind_error':'Error unbinding device {busid}: "
+                          "{error}'},'zh':{'title':'USB/IP "
+                          "管理器','device':'设备信息','busid':'总线ID','status':'状态','action':'"
+                          "操作','bound':'已绑定','unbound':'未绑定','bind':'绑定','unbind':'解绑'"
+                          ",'"
+                          "connected':'已连接','disconnected':'已断开','error':'错误','author':'"
+                          "作者'"
+                          ",'log_title':'操作日志','clear':'清除','bind_success':'设备 {busid} "
+                          "绑定成功','unbind_success':'设备 {busid} "
+                          "解绑成功','bind_error':'绑定设备 "
+                          "{busid} 失败: {error}','unbind_error':'解绑设备 {busid} 失败: "
+                          "{error}'}};"
+                          "function detectLang(){"
+                          "try{"
+                          "const stored=localStorage.getItem('usbctl_lang');"
+                          "if(stored&&i18n[stored])return stored;"
+                          "const "
+                          "nav=navigator.language||navigator.userLanguage||navigator."
+                          "browserLanguage|"
+                          "|'en';"
+                          "const langCode=nav.toLowerCase();"
+                          "if(langCode.startsWith('zh')||langCode.includes('chinese')||langCode."
+                          "includes('cn'))return 'zh';"
+                          "return 'en';"
+                          "}catch(e){return 'en';}"
+                          "}"
+                          "function t(k,vars){let "
+                          "text=i18n[lang][k]||k;if(vars){Object.keys(vars).forEach(key=>{text="
+                          "text."
+                          "replace(`{${key}}`,vars[key]);})}return text;}"
+                          "function "
+                          "setLang(l){lang=l;localStorage.setItem('usbctl_lang',l);updateUI();}"
+                          "function updateUI(){"
+                          "document.title=`usbctl - ${t('title')}`;"
+                          "document.querySelector('h1').textContent=t('title');"
+                          "document.documentElement.lang=lang==='zh'?'zh-CN':'en';"
+                          "const ths=document.querySelectorAll('th');"
+                          "if(ths.length>=4){ths[0].textContent=t('device');ths[1].textContent=t('"
+                          "busid');ths[2].textContent=t('status');ths[3].textContent=t('action');}"
+                          "document.querySelectorAll('.lang-btn').forEach(b=>b.classList.toggle('"
+                          "active',b.dataset.lang===lang));"
+                          "const logTitle=document.querySelector('.log-title');"
+                          "if(logTitle)logTitle.textContent=t('log_title');"
+                          "const clearBtn=document.querySelector('.clear-log-btn');"
+                          "if(clearBtn)clearBtn.textContent=t('clear');"
+                          "render();renderLog();"
+                          "}"
+                          "function connectSSE(){"
+                          "if(eventSource)eventSource.close();"
+                          "eventSource=new EventSource('/events');"
+                          "eventSource.onopen=()=>document.getElementById('status').textContent=t("
+                          "'"
+                          "connected');"
+                          "eventSource.onmessage=e=>{"
+                          "try{devices=JSON.parse(e.data);render();}catch(err){console.error(err);"
+                          "}"
+                          "};"
+                          "eventSource.onerror=()=>{"
+                          "document.getElementById('status').textContent=t('disconnected');"
+                          "setTimeout(connectSSE,3000);"
+                          "};"
+                          "}"
+                          "function render(){"
+                          "const tbody=document.querySelector('tbody');"
+                          "tbody.innerHTML=devices.map(d=>"
+                          "`<tr><td>${d.info}</td><td><code>${d.busid}</code></td>`+"
+                          "`<td><span class=\"status "
+                          "${d.bound?'bound':'unbound'}\">${t(d.bound?'bound':'unbound')}</span></"
+                          "td>`+"
+                          "`<td><button class=\"${d.bound?'btn-unbind':'btn-bind'}\" "
+                          "onclick=\"toggle('${d.busid}')\">`+"
+                          "`${t(d.bound?'unbind':'bind')}</button></td></tr>`).join('');"
+                          "}"
+                          "function addLog(type,message){"
+                          "const timestamp=new Date().toLocaleTimeString();"
+                          "const entry={type,message,timestamp};"
+                          "logEntries.unshift(entry);"
+                          "if(logEntries.length>100)logEntries.pop();"
+                          "renderLog();"
+                          "}"
+                          "function renderLog(){"
+                          "const logContent=document.getElementById('logContent');"
+                          "if(!logContent)return;"
+                          "logContent.innerHTML=logEntries.map(entry=>"
+                          "`<div class=\"log-entry log-${entry.type}\">`+"
+                          "`<span class=\"log-timestamp\">[${entry.timestamp}]</span> "
+                          "${entry.message}`+"
+                          "`</div>`).join('');"
+                          "logContent.scrollTop=0;"
+                          "}"
+                          "function clearLog(){"
+                          "logEntries=[];"
+                          "renderLog();"
+                          "}"
+                          "function toggle(busid){"
+                          "const device=devices.find(d=>d.busid===busid);"
+                          "if(!device)return;"
+                          "const button=event.target;"
+                          "const action=device.bound?'unbind':'bind';"
+                          "button.disabled=true;"
+                          "fetch(`/${action}`,{method:'POST',headers:{'Content-Type':'application/"
+                          "json'},"
+                          "body:JSON.stringify({busid})})"
+                          ".then(response=>{"
+                          "if(response.ok){"
+                          "return response.json().then(data=>{"
+                          "addLog('success',t(`${action}_success`,{busid}));"
+                          "if(data.devices){"
+                          "devices=data.devices;"
+                          "render();"
+                          "}else{"
+                          "loadDevices();"
+                          "}"
+                          "});"
+                          "}else{"
+                          "return response.text().then(text=>{"
+                          "let errorMsg='Unknown error';"
+                          "try{"
+                          "const data=JSON.parse(text);"
+                          "if(data.error){"
+                          "errorMsg=data.error.trim();"
+                          "const errorMatch=errorMsg.match(/error[:\\s]*(.+?)(?:\\n|$)/i);"
+                          "if(errorMatch)errorMsg=errorMatch[1];"
+                          "}"
+                          "}catch(e){"
+                          "const errorMatch=text.match(/error[:\\s]*(.+?)(?:\\n|$)/i);"
+                          "if(errorMatch)errorMsg=errorMatch[1];"
+                          "}"
+                          "addLog('error',t(`${action}_error`,{busid,error:errorMsg}));"
+                          "throw new Error(errorMsg);"
+                          "});"
+                          "}"
+                          "})"
+                          ".catch(err=>{"
+                          "console.error(err);"
+                          "})"
+                          ".finally(()=>button.disabled=false);"
+                          "}"
+                          "function loadDevices(){"
+                          "fetch('/api/"
+                          "devices').then(r=>r.json()).then(data=>{devices=data;render()}).catch("
+                          "console.error);"
+                          "}"
+                          "window.onload=()=>{"
+                          "lang=detectLang();"
+                          "updateUI();connectSSE();loadDevices();"
+                          "};";
 
 // Embedded HTML (Optimized responsive template)
-const char *EMBEDDED_HTML =
-    "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
-    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,user-scalable=no\">"
-    "<title>usbctl - USB/IP Manager</title><style>%s</style></head><body>"
-    "<header><div class=\"logo\">%s</div><h1>USB/IP Manager</h1>"
-    "</header>"
-    "<div class=\"controls\">"
-    "<button class=\"lang-btn active\" data-lang=\"en\" onclick=\"setLang('en')\">English</button>"
-    "<button class=\"lang-btn\" data-lang=\"zh\" onclick=\"setLang('zh')\">中文</button>"
-    "</div>"
-    "<div id=\"status\">Connecting...</div>"
-    "<div class=\"main-content\">"
-    "<table><thead><tr><th>Device Info</th><th>Bus ID</th><th>Status</th><th>Action</th></tr></thead>"
-    "<tbody></tbody></table>"
-    "</div>"
-    "<div class=\"log-container\">"
-    "<div class=\"log-header\">"
-    "<span class=\"log-title\">Operation Log</span>"
-    "<button class=\"clear-log-btn\" onclick=\"clearLog()\">Clear</button>"
-    "</div>"
-    "<div class=\"log-content\" id=\"logContent\"></div>"
-    "</div>"
-    "<div class=\"footer\">Powered by <a href=\"https://github.com/suifei/usbctl\" target=\"_blank\">usbctl v" VERSION "</a> | "
-    "<a href=\"https://github.com/suifei\" target=\"_blank\">github.com/suifei</a></div>"
-    "<script>%s</script></body></html>";
+const char *EMBEDDED_HTML = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+                            "<meta name=\"viewport\" "
+                            "content=\"width=device-width,initial-scale=1,user-scalable=no\">"
+                            "<title>usbctl - USB/IP Manager</title><style>%s</style></head><body>"
+                            "<header><div class=\"logo\">%s</div><h1>USB/IP Manager</h1>"
+                            "</header>"
+                            "<div class=\"controls\">"
+                            "<button class=\"lang-btn active\" data-lang=\"en\" "
+                            "onclick=\"setLang('en')\">English</button>"
+                            "<button class=\"lang-btn\" data-lang=\"zh\" "
+                            "onclick=\"setLang('zh')\">中文</button>"
+                            "</div>"
+                            "<div id=\"status\">Connecting...</div>"
+                            "<div class=\"main-content\">"
+                            "<table><thead><tr><th>Device Info</th><th>Bus "
+                            "ID</th><th>Status</th><th>Action</th></tr></thead>"
+                            "<tbody></tbody></table>"
+                            "</div>"
+                            "<div class=\"log-container\">"
+                            "<div class=\"log-header\">"
+                            "<span class=\"log-title\">Operation Log</span>"
+                            "<button class=\"clear-log-btn\" onclick=\"clearLog()\">Clear</button>"
+                            "</div>"
+                            "<div class=\"log-content\" id=\"logContent\"></div>"
+                            "</div>"
+                            "<div class=\"footer\">Powered by <a "
+                            "href=\"https://github.com/suifei/usbctl\" target=\"_blank\">usbctl "
+                            "v" VERSION "</a> | "
+                            "<a href=\"https://github.com/suifei\" "
+                            "target=\"_blank\">github.com/suifei</a></div>"
+                            "<script>%s</script></body></html>";
 
 // ============================================================================
 // LOGGING AND SYSTEM COMPATIBILITY
@@ -508,14 +628,14 @@ int check_system_compatibility()
 
     log_message("INFO", "Running on %s platform", platform);
 
-    // Check for usbip command availability with different search patterns per platform
+    // Check for usbip command availability with different search patterns per
+    // platform
 #ifdef __linux__
-    if (access("/usr/bin/usbip", X_OK) != 0 &&
-        access("/usr/sbin/usbip", X_OK) != 0 &&
-        access("/bin/usbip", X_OK) != 0 &&
-        access("/sbin/usbip", X_OK) != 0)
+    if (access("/usr/bin/usbip", X_OK) != 0 && access("/usr/sbin/usbip", X_OK) != 0 &&
+        access("/bin/usbip", X_OK) != 0 && access("/sbin/usbip", X_OK) != 0)
     {
-        log_message("WARN", "usbip command not found. Install: sudo apt install linux-tools-generic");
+        log_message("WARN", "usbip command not found. Install: sudo apt install "
+                            "linux-tools-generic");
     }
 
     // Check if usbip-host module is available
@@ -532,8 +652,7 @@ int check_system_compatibility()
 
 #elif __APPLE__
     // macOS: Check for third-party usbip implementations
-    if (access("/usr/local/bin/usbip", X_OK) != 0 &&
-        access("/opt/homebrew/bin/usbip", X_OK) != 0 &&
+    if (access("/usr/local/bin/usbip", X_OK) != 0 && access("/opt/homebrew/bin/usbip", X_OK) != 0 &&
         access("/usr/bin/usbip", X_OK) != 0)
     {
         log_message("WARN", "usbip command not found. Limited functionality available");
@@ -547,7 +666,7 @@ int check_system_compatibility()
 
 #elif _WIN32
     log_message("INFO", "Windows support requires usbipd-win or usbip-win");
-    
+
     // Check for usbipd-win installation
     char output[512];
     if (exec_command("usbipd --version", output, sizeof(output)) == 0)
@@ -560,10 +679,11 @@ int check_system_compatibility()
     }
     else
     {
-        log_message("WARN", "usbipd-win not found. Install from: https://github.com/dorssel/usbipd-win");
+        log_message("WARN", "usbipd-win not found. Install from: "
+                            "https://github.com/dorssel/usbipd-win");
         log_message("INFO", "Alternative: Install usbip-win or use WSL with Linux usbip tools");
     }
-    
+
     // Check if running as Administrator (optional for web interface)
     // Note: Checking admin privileges on Windows requires additional APIs
     log_message("INFO", "For full functionality, run as Administrator");
@@ -611,11 +731,14 @@ const char *get_home_dir()
 {
 #ifdef PLATFORM_WINDOWS
     const char *home = getenv("USERPROFILE");
-    if (!home) {
+    if (!home)
+    {
         home = getenv("HOMEDRIVE");
-        if (home) {
+        if (home)
+        {
             const char *homepath = getenv("HOMEPATH");
-            if (homepath) {
+            if (homepath)
+            {
                 static char win_home[512];
                 snprintf(win_home, sizeof(win_home), "%s%s", home, homepath);
                 return win_home;
@@ -633,11 +756,9 @@ const char *get_home_dir()
 void init_config()
 {
 #ifdef PLATFORM_WINDOWS
-    snprintf(g_config.config_path, sizeof(g_config.config_path),
-             "%s\\AppData\\Local\\usbctl\\config", get_home_dir());
+    snprintf(g_config.config_path, sizeof(g_config.config_path), "%s\\AppData\\Local\\usbctl\\config", get_home_dir());
 #else
-    snprintf(g_config.config_path, sizeof(g_config.config_path),
-             "/etc/usbctl/config");
+    snprintf(g_config.config_path, sizeof(g_config.config_path), "/etc/usbctl/config");
 #endif
 }
 
@@ -650,7 +771,7 @@ int mkdirs(const char *path)
 
     snprintf(tmp, sizeof(tmp), "%s", path);
     len = strlen(tmp);
-    
+
 #ifdef PLATFORM_WINDOWS
     // Handle Windows path separators
     if (tmp[len - 1] == '\\' || tmp[len - 1] == '/')
@@ -664,7 +785,7 @@ int mkdirs(const char *path)
         {
             char sep = *p;
             *p = 0;
-            mkdir(tmp, 0755);  // Windows _mkdir macro doesn't use mode parameter
+            mkdir(tmp, 0755); // Windows _mkdir macro doesn't use mode parameter
             *p = sep;
         }
     }
@@ -698,12 +819,12 @@ int load_config()
 
     char line[256];
     g_config.bound_devices_count = 0; // Reset bound devices count
-    
+
     while (fgets(line, sizeof(line), fp))
     {
         // Remove trailing newline
         line[strcspn(line, "\n")] = '\0';
-        
+
         if (strncmp(line, "port=", 5) == 0)
         {
             g_config.port = atoi(line + 5);
@@ -733,7 +854,7 @@ int load_config()
         }
     }
     fclose(fp);
-    
+
     log_message("INFO", "Configuration loaded: %d bound devices found", g_config.bound_devices_count);
     return 1;
 }
@@ -758,7 +879,7 @@ int save_config()
     fprintf(fp, "port=%d\n", g_config.port);
     fprintf(fp, "bind=%s\n", g_config.bind_address);
     fprintf(fp, "poll_interval=%d\n", g_config.poll_interval);
-    
+
     // Save currently bound devices
     update_bound_devices_config();
     for (int i = 0; i < g_config.bound_devices_count; i++)
@@ -768,7 +889,7 @@ int save_config()
             fprintf(fp, "bound_device=%s\n", g_config.bound_devices[i]);
         }
     }
-    
+
     fclose(fp);
     log_message("INFO", "Configuration saved with %d bound devices", g_config.bound_devices_count);
     return 1;
@@ -787,10 +908,10 @@ void update_bound_devices_config()
         if (g_devices[i].bound && g_config.bound_devices_count < MAX_DEVICES)
         {
             // Use snprintf for safer string copying, limit to busid size
-            int len = snprintf(g_config.bound_devices[g_config.bound_devices_count], 
-                    sizeof(g_config.bound_devices[0]), "%.*s", 
-                    (int)sizeof(g_devices[i].busid)-1, g_devices[i].busid);
-            if (len > 0 && len < (int)sizeof(g_config.bound_devices[0])) {
+            int len = snprintf(g_config.bound_devices[g_config.bound_devices_count], sizeof(g_config.bound_devices[0]),
+                               "%.*s", (int)sizeof(g_devices[i].busid) - 1, g_devices[i].busid);
+            if (len > 0 && len < (int)sizeof(g_config.bound_devices[0]))
+            {
                 g_config.bound_devices_count++;
             }
         }
@@ -801,7 +922,7 @@ void update_bound_devices_config()
 void restore_bound_devices()
 {
     log_message("INFO", "Restoring bound devices from configuration...");
-    
+
     for (int i = 0; i < g_config.bound_devices_count; i++)
     {
         if (strlen(g_config.bound_devices[i]) > 0)
@@ -813,12 +934,14 @@ void restore_bound_devices()
             }
             else
             {
-                log_message("WARNING", "Failed to restore bind for device: %s (device may not be available)", 
-                           g_config.bound_devices[i]);
+                log_message("WARNING",
+                            "Failed to restore bind for device: %s (device may not be "
+                            "available)",
+                            g_config.bound_devices[i]);
             }
         }
     }
-    
+
     log_message("INFO", "Bound device restoration completed");
 }
 
@@ -880,27 +1003,80 @@ int is_device_bound(const char *busid)
     snprintf(path, sizeof(path), "/sys/bus/usb/drivers/usbip-host/%s", busid);
     return access(path, F_OK) == 0;
 }
+// Parse output of 'lsusb' and populate g_lsusb_map
+static void parse_lsusb(const char *output)
+{
+    g_lsusb_count = 0;
+    if (!output)
+        return;
 
-// List USB/IP devices with enhanced compatibility
+    char *buf = strdup(output);
+    if (!buf)
+        return;
+
+    char *line = strtok(buf, "\n");
+    while (line && g_lsusb_count < MAX_LSUSB_ENTRIES)
+    {
+        char *id_pos = strstr(line, "ID ");
+        if (id_pos)
+        {
+            id_pos += 3;
+            char *colon = strchr(id_pos, ':');
+            if (colon && (colon - id_pos == 4))
+            {
+                char vid[5] = {0}, pid[5] = {0};
+
+                strncpy(vid, id_pos, 4);
+                strncpy(pid, colon + 1, 4);
+
+                char *desc_start = colon + 5;
+                while (*desc_start == ' ')
+                    desc_start++;
+
+                if (*desc_start)
+                {
+                    snprintf(g_lsusb_map[g_lsusb_count].id, sizeof(g_lsusb_map[0].id), "%s:%s", vid, pid);
+                    strncpy(g_lsusb_map[g_lsusb_count].desc, desc_start, sizeof(g_lsusb_map[0].desc) - 1);
+                    g_lsusb_map[g_lsusb_count].desc[sizeof(g_lsusb_map[0].desc) - 1] = '\0';
+                    g_lsusb_count++;
+                }
+            }
+        }
+        line = strtok(NULL, "\n");
+    }
+    free(buf);
+}
+// List USB/IP devices with enhanced compatibility and lsusb fallback
 int list_usbip_devices()
 {
     char output[4096];
+    char lsusb_output[8192]; // lsusb output can be larger
 
-    // Platform-specific usbip command variations for compatibility
+    // Step 1: Try to get lsusb data first (for fallback)
+    g_lsusb_count = 0;
+    if (exec_command("lsusb", lsusb_output, sizeof(lsusb_output)) == 0)
+    {
+        parse_lsusb(lsusb_output);
+    }
+    else
+    {
+        log_message("WARN", "Failed to run 'lsusb', device descriptions may be incomplete");
+    }
+
+    // Step 2: Try usbip commands
 #ifdef PLATFORM_WINDOWS
-    const char *usbip_commands[] = {
-        "usbipd wsl list",                    // usbipd-win for WSL
-        "usbip list -l",                      // Standard command (if available)
-        "wsl usbip list -l",                  // Via WSL
-        "C:\\Program Files\\usbipd-win\\usbipd.exe wsl list", // Full path usbipd-win
-        NULL};
+    const char *usbip_commands[] = {"usbipd wsl list",   // usbipd-win for WSL
+                                    "usbip list -l",     // Standard command (if available)
+                                    "wsl usbip list -l", // Via WSL
+                                    "C:\\Program Files\\usbipd-win\\usbipd.exe wsl list", // Full path
+                                                                                          // usbipd-win
+                                    NULL};
 #else
-    const char *usbip_commands[] = {
-        "usbip list -l",           // Standard command
-        "/usr/bin/usbip list -l",  // Explicit path
-        "/usr/sbin/usbip list -l", // Alternative path
-        "usbip list --local",      // Alternative syntax
-        NULL};
+    const char *usbip_commands[] = {"usbip list -l",           // Standard command
+                                    "/usr/bin/usbip list -l",  // Explicit path
+                                    "/usr/sbin/usbip list -l", // Alternative path
+                                    "usbip list --local",      // Alternative syntax
+                                    NULL};
 #endif
 
     int cmd_success = 0;
@@ -909,7 +1085,8 @@ int list_usbip_devices()
         if (exec_command(usbip_commands[i], output, sizeof(output)) == 0)
         {
             cmd_success = 1;
-            // Only log command success during startup or if verbose logging enabled
+            // Only log command success during startup or if verbose logging
+            // enabled
             if (!g_server_started || g_config.verbose_logging)
             {
                 log_message("DEBUG", "Successfully executed: %s", usbip_commands[i]);
@@ -922,73 +1099,143 @@ int list_usbip_devices()
     {
         if (!g_usbip_error_shown)
         {
-            log_message("ERROR", "Failed to execute usbip command. Ensure usbip tools are installed");
+            log_message("ERROR", "Failed to execute usbip command. Ensure "
+                                 "usbip tools are installed");
             g_usbip_error_shown = 1;
         }
         return 0;
     }
 
+    // Step 3: Parse usbip output
     g_device_count = 0;
-    char *line = strtok(output, "\n");
+    char *buf = strdup(output);
+    if (!buf)
+        return 0;
+
+    char *line = strtok(buf, "\n");
     usb_device_t *current = NULL;
 
     while (line && g_device_count < MAX_DEVICES)
     {
-        // Trim whitespace
-        while (*line == ' ' || *line == '\t')
-            line++;
+        char *original_line = line; // ← 保留原始行用于缩进判断
 
-        // Handle different output formats
-        if (strncmp(line, "- busid", 7) == 0 || strstr(line, "busid"))
+        // Trim leading whitespace for content
+        char *trimmed = line;
+        while (*trimmed == ' ' || *trimmed == '\t')
+            trimmed++;
+
+        if (trimmed[0] == '\0')
         {
-            // New device found
+            line = strtok(NULL, "\n");
+            continue;
+        }
+
+        // New device line
+        if (strncmp(trimmed, "- busid", 7) == 0)
+        {
             current = &g_devices[g_device_count++];
             memset(current, 0, sizeof(usb_device_t));
 
-            // Extract busid - handle various formats
-            char *busid_start = NULL;
-            if ((busid_start = strstr(line, "busid ")) != NULL)
-            {
+            // Extract busid
+            char *busid_start = strstr(trimmed, "busid ");
+            if (busid_start)
                 busid_start += 6;
-            }
-            else if ((busid_start = strchr(line, ' ')) != NULL)
-            {
-                busid_start++;
-            }
+            else
+                busid_start = trimmed + 8;
 
+            while (busid_start && *busid_start == ' ')
+                busid_start++;
             if (busid_start)
             {
-                while (*busid_start == ' ')
-                    busid_start++;
-                sscanf(busid_start, "%15s", current->busid);
+                char *end = strpbrk(busid_start, " \t(");
+                if (end)
+                {
+                    int len = (end - busid_start < 15) ? (end - busid_start) : 15;
+                    memcpy(current->busid, busid_start, len);
+                    current->busid[len] = '\0';
+                }
+                else
+                {
+                    strncpy(current->busid, busid_start, 15);
+                    current->busid[15] = '\0';
+                }
                 current->bound = is_device_bound(current->busid);
-                // Only log device discovery during startup or if verbose logging enabled
                 if (!g_server_started || g_config.verbose_logging)
                 {
                     log_message("DEBUG", "Found device: %s (bound: %d)", current->busid, current->bound);
                 }
             }
         }
-        else if (current && (strchr(line, ':') || strstr(line, "ID ")))
+        // Device description line: must be indented in ORIGINAL line
+        else if (current && (original_line[0] == ' ' || original_line[0] == '\t'))
         {
-            // Device info line - handle various description formats
             if (strlen(current->info) > 0)
             {
                 strncat(current->info, " ", sizeof(current->info) - strlen(current->info) - 1);
             }
-
-            // Clean up common prefixes and unnecessary whitespace
-            char *clean_line = line;
-            while (*clean_line == ' ' || *clean_line == '\t')
-                clean_line++;
-            if (strncmp(clean_line, "ID ", 3) == 0)
-                clean_line += 3;
-
-            strncat(current->info, clean_line, sizeof(current->info) - strlen(current->info) - 1);
+            strncat(current->info, trimmed, sizeof(current->info) - strlen(current->info) - 1);
         }
+
         line = strtok(NULL, "\n");
     }
 
+    // Step 4: Fallback to lsusb for "unknown" devices
+    for (int i = 0; i < g_device_count; i++)
+    {
+        if (strstr(g_devices[i].info, "unknown vendor"))
+        {
+            // Extract VID:PID from original usbip line (we need to re-parse
+            // output for this) Simpler: scan original output for this busid's
+            // line
+            char *search = buf;
+            char *busid_line = NULL;
+            while ((search = strstr(search, g_devices[i].busid)) != NULL)
+            {
+                // Check if this is a busid line
+                if (search > buf && *(search - 1) == ' ')
+                {
+                    // Find start of line
+                    char *start = search;
+                    while (start > buf && *(start - 1) != '\n')
+                        start--;
+                    if (strncmp(start, " - busid", 8) == 0)
+                    {
+                        busid_line = start;
+                        break;
+                    }
+                }
+                search++;
+            }
+
+            if (busid_line)
+            {
+                char *paren = strchr(busid_line, '(');
+                if (paren)
+                {
+                    char vidpid[10] = {0};
+                    sscanf(paren + 1, "%9[^)]", vidpid); // extract "303a:1001"
+
+                    // Look up in lsusb map
+                    for (int j = 0; j < g_lsusb_count; j++)
+                    {
+                        if (strcmp(g_lsusb_map[j].id, vidpid) == 0)
+                        {
+                            strncpy(g_devices[i].info, g_lsusb_map[j].desc, sizeof(g_devices[i].info) - 1);
+                            g_devices[i].info[sizeof(g_devices[i].info) - 1] = '\0';
+                            if (!g_server_started || g_config.verbose_logging)
+                            {
+                                log_message("DEBUG", "Enhanced device %s info: %s", g_devices[i].busid,
+                                            g_devices[i].info);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    free(buf);
     return g_device_count;
 }
 
@@ -1010,7 +1257,7 @@ int bind_device(const char *busid)
     // Unix/Linux: Standard usbip command
     snprintf(cmd, sizeof(cmd), "usbip bind -b %s", busid);
 #endif
-    
+
     log_message("INFO", "Attempting to bind device: %s", busid);
 
     int result = (exec_command(cmd, output, sizeof(output)) == 0);
@@ -1037,7 +1284,7 @@ int unbind_device(const char *busid)
         log_message("ERROR", "Invalid busid: %s", busid ? busid : "(null)");
         return 0;
     }
-    
+
     char cmd[256];
 #ifdef PLATFORM_WINDOWS
     // Windows: Try different usbipd-win commands
@@ -1046,11 +1293,11 @@ int unbind_device(const char *busid)
     // Unix/Linux: Standard usbip command
     snprintf(cmd, sizeof(cmd), "usbip unbind -b %s", busid);
 #endif
-    
+
     log_message("INFO", "Attempting to unbind device: %s", busid);
     char output[1024];
     int result = exec_command(cmd, output, sizeof(output)) == 0;
-    
+
     if (result)
     {
         log_message("INFO", "Successfully unbound device: %s", busid);
@@ -1062,7 +1309,7 @@ int unbind_device(const char *busid)
         log_message("INFO", "Ensure usbipd-win is installed and device is attached");
 #endif
     }
-    
+
     log_message("DEBUG", "Command output: %s", output);
     return result;
 }
@@ -1073,10 +1320,11 @@ int unbind_device_web(int client_socket, const char *busid)
     if (!busid || strlen(busid) == 0)
     {
         log_message("ERROR", "Invalid busid: %s", busid ? busid : "(null)");
-        send_http_response(client_socket, 400, "Bad Request", "application/json", "{\"status\":\"failed\",\"error\":\"Invalid busid\"}");
+        send_http_response(client_socket, 400, "Bad Request", "application/json",
+                           "{\"status\":\"failed\",\"error\":\"Invalid busid\"}");
         return 0;
     }
-    
+
     char cmd[256];
 #ifdef PLATFORM_WINDOWS
     // Windows: Try different usbipd-win commands
@@ -1085,11 +1333,11 @@ int unbind_device_web(int client_socket, const char *busid)
     // Unix/Linux: Standard usbip command
     snprintf(cmd, sizeof(cmd), "usbip unbind -b %s", busid);
 #endif
-    
+
     log_message("INFO", "Attempting to unbind device: %s", busid);
     char output[1024];
     int result = exec_command(cmd, output, sizeof(output)) == 0;
-    
+
     if (result)
     {
         log_message("INFO", "Successfully unbound device: %s", busid);
@@ -1114,8 +1362,8 @@ void generate_html_page(char *buffer, size_t buffer_size)
 }
 
 // Send HTTP response
-void send_http_response(int client_socket, int status_code, const char *status_text,
-                        const char *content_type, const char *body)
+void send_http_response(int client_socket, int status_code, const char *status_text, const char *content_type,
+                        const char *body)
 {
     char header[512];
     int body_len = body ? strlen(body) : 0;
@@ -1138,7 +1386,8 @@ void send_http_response(int client_socket, int status_code, const char *status_t
 // Generate JSON for devices
 void generate_devices_json(char *buffer, size_t buffer_size)
 {
-    if (buffer_size == 0) return;
+    if (buffer_size == 0)
+        return;
     buffer[0] = '\0';
     strncat(buffer, "[", buffer_size - 1);
     for (int i = 0; i < g_device_count; i++)
@@ -1151,28 +1400,33 @@ void generate_devices_json(char *buffer, size_t buffer_size)
         {
             unsigned char c = (unsigned char)info_src[j];
             // Escape quotes and backslashes minimally
-            if (c == '"' || c == '\\') {
-                if (k + 2 >= sizeof(info_sanitized) - 1) break;
+            if (c == '"' || c == '\\')
+            {
+                if (k + 2 >= sizeof(info_sanitized) - 1)
+                    break;
                 info_sanitized[k++] = '\\';
                 info_sanitized[k++] = c;
-            } else if ((c >= 32 && c < 127)) {
+            }
+            else if ((c >= 32 && c < 127))
+            {
                 info_sanitized[k++] = c;
-            } else {
+            }
+            else
+            {
                 // skip non printable
             }
         }
         info_sanitized[k] = '\0';
 
         char device_json[384];
-        int written = snprintf(device_json, sizeof(device_json),
-                               "%s{\"busid\":\"%s\",\"info\":\"%s\",\"bound\":%s}",
-                               i > 0 ? "," : "",
-                               g_devices[i].busid,
-                               info_sanitized,
-                               g_devices[i].bound ? "true" : "false");
-        if (written < 0) continue;
+        int written =
+            snprintf(device_json, sizeof(device_json), "%s{\"busid\":\"%s\",\"info\":\"%s\",\"bound\":%s}",
+                     i > 0 ? "," : "", g_devices[i].busid, info_sanitized, g_devices[i].bound ? "true" : "false");
+        if (written < 0)
+            continue;
         size_t remaining = buffer_size - strlen(buffer) - 1;
-        if ((size_t)written > remaining) {
+        if ((size_t)written > remaining)
+        {
             // No more space; close array and stop
             strncat(buffer, "]", buffer_size - strlen(buffer) - 1);
             return;
@@ -1191,7 +1445,8 @@ ssize_t send_sse_message(int client_socket, const char *data)
     const size_t suffix_len = 2; // "\n\n"
     size_t max_payload = sizeof(response) - prefix_len - suffix_len - 1;
     size_t data_len = strlen(data);
-    if (data_len > max_payload) data_len = max_payload;
+    if (data_len > max_payload)
+        data_len = max_payload;
     memcpy(response, "data: ", prefix_len);
     memcpy(response + prefix_len, data, data_len);
     response[prefix_len + data_len] = '\n';
@@ -1203,13 +1458,12 @@ ssize_t send_sse_message(int client_socket, const char *data)
 // Send SSE headers
 void send_sse_headers(int client_socket)
 {
-    const char *headers = 
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/event-stream\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Connection: keep-alive\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "\r\n";
+    const char *headers = "HTTP/1.1 200 OK\r\n"
+                          "Content-Type: text/event-stream\r\n"
+                          "Cache-Control: no-cache\r\n"
+                          "Connection: keep-alive\r\n"
+                          "Access-Control-Allow-Origin: *\r\n"
+                          "\r\n";
     send(client_socket, headers, strlen(headers), MSG_NOSIGNAL);
 }
 
@@ -1295,13 +1549,14 @@ void broadcast_devices_update()
     generate_devices_json(json, sizeof(json));
 
     pthread_mutex_lock(&g_mutex);
-    
+
     // 安全检查：确保客户端列表有效
-    if (g_client_count <= 0) {
+    if (g_client_count <= 0)
+    {
         pthread_mutex_unlock(&g_mutex);
         return;
     }
-    
+
     for (int i = g_client_count - 1; i >= 0; i--)
     {
         if (g_clients[i].is_sse)
@@ -1312,7 +1567,8 @@ void broadcast_devices_update()
             {
                 close(g_clients[i].socket);
                 // Remove client by moving last client to current position
-                if (i < g_client_count - 1) {
+                if (i < g_client_count - 1)
+                {
                     g_clients[i] = g_clients[g_client_count - 1];
                 }
                 g_client_count--;
@@ -1403,7 +1659,7 @@ void *handle_client(void *arg)
     {
         // Send SSE headers
         send_sse_headers(client_socket);
-        
+
         // Add client to SSE clients list
         struct sockaddr_in addr;
         socklen_t addr_len = sizeof(addr);
@@ -1419,14 +1675,14 @@ void *handle_client(void *arg)
 #ifdef PLATFORM_WINDOWS
         // Windows requires char* for setsockopt and different timeout setting
         DWORD timeout = 30000; // 30 seconds in milliseconds
-        setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+        setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
 #else
         struct timeval tv;
         tv.tv_sec = 30; // 30 second timeout for heartbeat
         tv.tv_usec = 0;
         setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
-        
+
         while (g_running)
         {
             char dummy_buffer[64];
@@ -1498,7 +1754,7 @@ void *handle_client(void *arg)
                          "\r\n",
                          favicon_len);
                 send(client_socket, response_header, strlen(response_header), 0);
-                send(client_socket, (const char*)decoded_favicon, favicon_len, 0);
+                send(client_socket, (const char *)decoded_favicon, favicon_len, 0);
             }
         }
         else if (strcmp(path, "/api/devices") == 0)
@@ -1543,18 +1799,19 @@ void *handle_client(void *arg)
                         // Redirect stderr to stdout to capture error messages
                         snprintf(cmd, sizeof(cmd), "usbip bind -b %s 2>&1", busid_start);
                         log_message("INFO", "Attempting to bind device: %s", busid_start);
-                        
+
                         if (exec_command(cmd, output, sizeof(output)) == 0)
                         {
                             log_message("INFO", "Successfully bound device: %s", busid_start);
-                            // Update device list and generate response with devices
+                            // Update device list and generate response with
+                            // devices
                             list_usbip_devices();
                             save_config(); // 自动保存配置
                             char response_json[8192];
                             char devices_json[4096];
                             generate_devices_json(devices_json, sizeof(devices_json));
-                            snprintf(response_json, sizeof(response_json), 
-                                    "{\"status\":\"success\",\"devices\":%s}", devices_json);
+                            snprintf(response_json, sizeof(response_json), "{\"status\":\"success\",\"devices\":%s}",
+                                     devices_json);
                             send_http_response(client_socket, 200, "OK", "application/json", response_json);
                             // Also broadcast update to SSE clients
                             broadcast_devices_update();
@@ -1565,10 +1822,14 @@ void *handle_client(void *arg)
                             char error_response[2048];
                             // Clean up the error message
                             char *clean_output = output;
-                            while (*clean_output == '\n' || *clean_output == '\r' || *clean_output == ' ') clean_output++;
-                            if (strlen(clean_output) == 0) strcpy(clean_output, "Unknown error");
-                            snprintf(error_response, sizeof(error_response), "{\"status\":\"failed\",\"error\":\"%s\"}", clean_output);
-                            send_http_response(client_socket, 500, "Internal Server Error", "application/json", error_response);
+                            while (*clean_output == '\n' || *clean_output == '\r' || *clean_output == ' ')
+                                clean_output++;
+                            if (strlen(clean_output) == 0)
+                                strcpy(clean_output, "Unknown error");
+                            snprintf(error_response, sizeof(error_response), "{\"status\":\"failed\",\"error\":\"%s\"}",
+                                     clean_output);
+                            send_http_response(client_socket, 500, "Internal Server Error", "application/json",
+                                               error_response);
                         }
                         // Trigger immediate update
                         list_usbip_devices();
@@ -1592,18 +1853,19 @@ void *handle_client(void *arg)
                         // Redirect stderr to stdout to capture error messages
                         snprintf(cmd, sizeof(cmd), "usbip unbind -b %s 2>&1", busid_start);
                         log_message("INFO", "Attempting to unbind device: %s", busid_start);
-                        
+
                         if (exec_command(cmd, output, sizeof(output)) == 0)
                         {
                             log_message("INFO", "Successfully unbound device: %s", busid_start);
-                            // Update device list and generate response with devices
+                            // Update device list and generate response with
+                            // devices
                             list_usbip_devices();
                             save_config(); // 自动保存配置
                             char response_json[8192];
                             char devices_json[4096];
                             generate_devices_json(devices_json, sizeof(devices_json));
-                            snprintf(response_json, sizeof(response_json), 
-                                    "{\"status\":\"success\",\"devices\":%s}", devices_json);
+                            snprintf(response_json, sizeof(response_json), "{\"status\":\"success\",\"devices\":%s}",
+                                     devices_json);
                             send_http_response(client_socket, 200, "OK", "application/json", response_json);
                             // Also broadcast update to SSE clients
                             broadcast_devices_update();
@@ -1614,10 +1876,14 @@ void *handle_client(void *arg)
                             char error_response[2048];
                             // Clean up the error message
                             char *clean_output = output;
-                            while (*clean_output == '\n' || *clean_output == '\r' || *clean_output == ' ') clean_output++;
-                            if (strlen(clean_output) == 0) strcpy(clean_output, "Unknown error");
-                            snprintf(error_response, sizeof(error_response), "{\"status\":\"failed\",\"error\":\"%s\"}", clean_output);
-                            send_http_response(client_socket, 500, "Internal Server Error", "application/json", error_response);
+                            while (*clean_output == '\n' || *clean_output == '\r' || *clean_output == ' ')
+                                clean_output++;
+                            if (strlen(clean_output) == 0)
+                                strcpy(clean_output, "Unknown error");
+                            snprintf(error_response, sizeof(error_response), "{\"status\":\"failed\",\"error\":\"%s\"}",
+                                     clean_output);
+                            send_http_response(client_socket, 500, "Internal Server Error", "application/json",
+                                               error_response);
                         }
                         // Trigger immediate update
                         list_usbip_devices();
@@ -1653,7 +1919,7 @@ void *server_thread(void *arg)
 
     int opt = 1;
 #ifdef PLATFORM_WINDOWS
-    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
 #else
     setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #endif
@@ -1797,12 +2063,14 @@ void print_usage()
     printf("  --version              Show version information\n");
     printf("  --help                 Show this help\n\n");
     printf("Examples:\n");
-    printf("  usbctl                 # Start web server (best practice defaults)\n");
+    printf("  usbctl                 # Start web server (best practice "
+           "defaults)\n");
     printf("  usbctl -p 8080         # Start server on port 8080\n");
     printf("  usbctl -v              # Start with verbose logging\n");
     printf("  usbctl --list          # List available USB devices\n");
     printf("  usbctl --bind 1-1.1    # Bind specific device\n\n");
-    printf("Default configuration follows convention over configuration principle.\n");
+    printf("Default configuration follows convention over configuration "
+           "principle.\n");
 }
 
 void print_version()
@@ -1832,7 +2100,8 @@ int install_systemd_service()
     // Windows doesn't support systemd, this function is not applicable
     log_message("ERROR", "Systemd service installation is not supported on Windows");
     printf("Error: Systemd service installation is not supported on Windows.\n");
-    printf("To run usbctl as a Windows service, consider using NSSM or similar tools.\n");
+    printf("To run usbctl as a Windows service, consider using NSSM or similar "
+           "tools.\n");
     return 1;
 #else
     // Get current executable path
@@ -1846,20 +2115,19 @@ int install_systemd_service()
     exe_path[len] = '\0';
 
     // Create service file content
-    const char *service_content =
-        "[Unit]\n"
-        "Description=usbctl - USB/IP Web Manager\n"
-        "After=network.target\n"
-        "\n"
-        "[Service]\n"
-        "Type=simple\n"
-        "User=root\n"
-        "ExecStart=%s\n"
-        "Restart=always\n"
-        "RestartSec=5\n"
-        "\n"
-        "[Install]\n"
-        "WantedBy=multi-user.target\n";
+    const char *service_content = "[Unit]\n"
+                                  "Description=usbctl - USB/IP Web Manager\n"
+                                  "After=network.target\n"
+                                  "\n"
+                                  "[Service]\n"
+                                  "Type=simple\n"
+                                  "User=root\n"
+                                  "ExecStart=%s\n"
+                                  "Restart=always\n"
+                                  "RestartSec=5\n"
+                                  "\n"
+                                  "[Install]\n"
+                                  "WantedBy=multi-user.target\n";
 
     char service_file[1024];
     snprintf(service_file, sizeof(service_file), service_content, exe_path);
@@ -1933,9 +2201,8 @@ void signal_handler(int sig)
 int main(int argc, char *argv[])
 {
     init_config();
-
-    g_config.verbose_logging = 0;
-
+    // Load configuration
+    load_config();
     // Parse command line arguments first to check for immediate commands
     for (int i = 1; i < argc; i++)
     {
@@ -2051,8 +2318,6 @@ int main(int argc, char *argv[])
         }
     }
 
-    // Load configuration
-    load_config();
 
     // Initialize platform-specific networking
     if (!init_platform_networking())
@@ -2082,7 +2347,7 @@ int main(int argc, char *argv[])
 
     // Initial device list
     list_usbip_devices();
-    
+
     // Restore bound devices from configuration (for system restart recovery)
     if (g_config.bound_devices_count > 0)
     {
