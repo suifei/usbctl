@@ -9,7 +9,7 @@ INSTALL_PATH="/usr/local/bin/usbctl"
 CONFIG_DIR="/etc/usbctl"
 LOG_FILE="/var/log/usbctl.log"
 SYSTEMD_SERVICE="/etc/systemd/system/${APP_NAME}.service"
-USBIPD_SERVICE="/etc/systemd/system/usbipd.service"  # 👈 新增
+USBIPD_SERVICE="/etc/systemd/system/usbipd.service"
 MODULES_FILE="/etc/modules-load.d/usbip.conf"
 LOGROTATE_FILE="/etc/logrotate.d/usbctl"
 
@@ -30,7 +30,8 @@ fi
 
 ### 1. Check port usage ###
 check_port() {
-    local port=$1
+    local port
+    port=$1
     if ss -tlnp | grep -q ":$port "; then
         warn "Port $port is already in use, trying to kill old process..."
         pkill -f "usbctl" 2>/dev/null || true
@@ -56,10 +57,16 @@ install_usbip() {
         fi
     fi
 
-    local kernel_pkg="linux-tools-$(uname -r)"
-    if apt-cache search "^${kernel_pkg}$" | grep -q linux-tools; then
-        log "Trying to install kernel-matched linux-tools: $kernel_pkg"
-        apt install -y "$kernel_pkg" && return
+    local kernel_pkg
+    local uname_r
+    if ! uname_r=$(uname -r); then
+        warn "Failed to get kernel release from uname; skipping kernel-matched linux-tools check."
+    else
+        kernel_pkg="linux-tools-$uname_r"
+        if apt-cache search "^${kernel_pkg}$" | grep -q linux-tools; then
+            log "Trying to install kernel-matched linux-tools: $kernel_pkg"
+            apt install -y "$kernel_pkg" && return
+        fi
     fi
 
     if apt install -y linux-tools-generic; then
@@ -251,8 +258,8 @@ case "${1:-install}" in
         check_port 11980
         install_usbip
         setup_usbip_module
-        create_usbipd_service   # 👈 新增：创建服务
-        start_usbipd            # 👈 现在只是确保服务运行
+        create_usbipd_service
+        start_usbipd
         configure_firewall
         install_binary
         create_systemd_service

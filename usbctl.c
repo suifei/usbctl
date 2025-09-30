@@ -2115,22 +2115,23 @@ int install_systemd_service()
     exe_path[len] = '\0';
 
     // Create service file content
-    const char *service_content = "[Unit]\n"
-                                  "Description=usbctl - USB/IP Web Manager\n"
-                                  "After=network.target\n"
-                                  "\n"
-                                  "[Service]\n"
-                                  "Type=simple\n"
-                                  "User=root\n"
-                                  "ExecStart=%s\n"
-                                  "Restart=always\n"
-                                  "RestartSec=5\n"
-                                  "\n"
-                                  "[Install]\n"
-                                  "WantedBy=multi-user.target\n";
-
     char service_file[1024];
-    snprintf(service_file, sizeof(service_file), "%s", service_content);
+    // 更安全的拼接方式，先格式化 ExecStart 行，再拼接其它内容，避免格式化字符串漏洞
+    snprintf(service_file, sizeof(service_file),
+        "[Unit]\n"
+        "Description=usbctl - USB/IP Web Manager\n"
+        "After=network.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "User=root\n"
+        "ExecStart=%s\n"
+        "Restart=always\n"
+        "RestartSec=5\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n",
+        exe_path);
 
     // Write service file
     FILE *fp = fopen("/etc/systemd/system/usbctl.service", "w");
