@@ -2130,7 +2130,7 @@ int install_systemd_service()
                                   "WantedBy=multi-user.target\n";
 
     char service_file[1024];
-    snprintf(service_file, sizeof(service_file), service_content, exe_path);
+    snprintf(service_file, sizeof(service_file), "%s", service_content);
 
     // Write service file
     FILE *fp = fopen("/etc/systemd/system/usbctl.service", "w");
