@@ -52,11 +52,6 @@ jobs:
             echo "VERSION=$(git describe --tags --always --dirty)" >> $GITHUB_OUTPUT
           fi
 
-      - name: Install dependencies
-        run: |
-          go mod download
-          go mod verify
-
       - name: Build all platforms
         run: make release
         env:
