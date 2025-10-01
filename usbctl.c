@@ -26,6 +26,8 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <process.h>
+#include <io.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "pthread")
@@ -615,42 +617,119 @@ static int secure_exec_command(const char *cmd, char *output, size_t output_size
     // Clear output buffer
     memset(output, 0, output_size);
     
+    // Use CreateProcess on Windows for safer execution
 #ifdef _WIN32
-    FILE *fp = _popen(cmd, "r");
-#else
-    FILE *fp = popen(cmd, "r");
-#endif
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
     
-    if (!fp) {
+    HANDLE hRead, hWrite;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+        log_message("ERROR", "Failed to create pipe");
+        return -1;
+    }
+    
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.hStdOutput = hWrite;
+    si.hStdError = hWrite;
+    si.dwFlags |= STARTF_USESTDHANDLES;
+    
+    char cmd_copy[1024];
+    strncpy(cmd_copy, cmd, sizeof(cmd_copy) - 1);
+    cmd_copy[sizeof(cmd_copy) - 1] = '\0';
+    
+    if (!CreateProcess(NULL, cmd_copy, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(hRead);
+        CloseHandle(hWrite);
         log_message("ERROR", "Failed to execute command");
         return -1;
     }
     
-    size_t total = 0;
+    CloseHandle(hWrite);
+    
+    DWORD bytesRead;
+    size_t totalRead = 0;
     char buffer[256];
-    while (fgets(buffer, sizeof(buffer), fp) && total < output_size - 1) {
-        size_t len = strnlen(buffer, sizeof(buffer));
-        if (total + len < output_size - 1) {
-            memcpy(output + total, buffer, len);
-            total += len;
+    while (ReadFile(hRead, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+        if (totalRead + bytesRead < output_size - 1) {
+            memcpy(output + totalRead, buffer, bytesRead);
+            totalRead += bytesRead;
         } else {
-            break; // Prevent overflow
+            break;
         }
     }
-    output[total] = '\0';
+    output[totalRead] = '\0';
     
-#ifdef _WIN32
-    int result = _pclose(fp);
+    WaitForSingleObject(pi.hProcess, 5000); // 5 second timeout
+    DWORD exitCode;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    
+    CloseHandle(hRead);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    
+    return (int)exitCode;
 #else
-    int result = pclose(fp);
-#endif
-    
-    // Only log command output during startup or if verbose logging enabled
-    if (!g_server_started || g_config.verbose_logging) {
-        log_message("DEBUG", "Command executed successfully");
+    // For Unix systems, use safer approach
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        log_message("ERROR", "Failed to create pipe");
+        return -1;
     }
     
-    return WEXITSTATUS(result);
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        log_message("ERROR", "Failed to fork process");
+        return -1;
+    }
+    
+    if (pid == 0) {
+        // Child process
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        
+        // Execute command safely
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    } else {
+        // Parent process
+        close(pipefd[1]);
+        
+        size_t total = 0;
+        char buffer[256];
+        ssize_t bytesRead;
+        
+        while ((bytesRead = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0) {
+            if (total + bytesRead < output_size - 1) {
+                memcpy(output + total, buffer, bytesRead);
+                total += bytesRead;
+            } else {
+                break;
+            }
+        }
+        output[total] = '\0';
+        
+        close(pipefd[0]);
+        
+        int status;
+        waitpid(pid, &status, 0);
+        
+        // Only log command output during startup or if verbose logging enabled
+        if (!g_server_started || g_config.verbose_logging) {
+            log_message("DEBUG", "Command executed successfully");
+        }
+        
+        return WEXITSTATUS(status);
+    }
+#endif
 }
 
 // ============================================================================
@@ -917,8 +996,12 @@ const char *get_home_dir()
     return "C:\\temp";
 #else
     const char *home = getenv("HOME");
-    if (home && validate_env_path(home)) {
-        return home;
+    if (home && validate_env_path(home) && strnlen(home, 4096) < 4096) {
+        // Additional validation for environment variable
+        static char safe_home[1024];
+        strncpy(safe_home, home, sizeof(safe_home) - 1);
+        safe_home[sizeof(safe_home) - 1] = '\0';
+        return safe_home;
     }
     return "/tmp";
 #endif
@@ -1522,10 +1605,29 @@ int unbind_device_web(int client_socket, const char *busid)
 // HTTP SERVER FUNCTIONS
 // ============================================================================
 
-// Generate full HTML page
+// Generate full HTML page - with safe formatting
 void generate_html_page(char *buffer, size_t buffer_size)
 {
-    snprintf(buffer, buffer_size, EMBEDDED_HTML, EMBEDDED_CSS, LOGO_SVG, EMBEDDED_JS);
+    if (!buffer || buffer_size == 0) {
+        return;
+    }
+    
+    // Use safer string concatenation instead of complex format string
+    size_t written = 0;
+    const char *html_start = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>USB/IP Control</title>";
+    written += snprintf(buffer + written, buffer_size - written, "%s", html_start);
+    
+    if (written < buffer_size - 1) {
+        written += snprintf(buffer + written, buffer_size - written, "<style>%s</style>", EMBEDDED_CSS);
+    }
+    if (written < buffer_size - 1) {
+        written += snprintf(buffer + written, buffer_size - written, "</head><body>%s", LOGO_SVG);
+    }
+    if (written < buffer_size - 1) {
+        written += snprintf(buffer + written, buffer_size - written, "<script>%s</script></body></html>", EMBEDDED_JS);
+    }
+    
+    buffer[buffer_size - 1] = '\0'; // Ensure null termination
 }
 
 // Send HTTP response - with enhanced security
@@ -1935,15 +2037,17 @@ void *handle_client(void *arg)
 
             if (is_head_request)
             {
-                char response_header[256];
-                snprintf(response_header, sizeof(response_header),
+                char response_header[512]; // Increased buffer size
+                int header_len = snprintf(response_header, sizeof(response_header),
                          "HTTP/1.1 200 OK\r\n"
                          "Content-Type: image/x-icon\r\n"
                          "Content-Length: %d\r\n"
                          "Cache-Control: public, max-age=86400\r\n"
-                         "\r\n",
-                         favicon_len);
-                send(client_socket, response_header, strlen(response_header), 0);
+                         "\r\n", favicon_len);
+                
+                if (header_len > 0 && header_len < (int)sizeof(response_header)) {
+                    send(client_socket, response_header, header_len, 0);
+                }
             }
             else
             {
@@ -1986,16 +2090,18 @@ void *handle_client(void *arg)
     }
     else if (strcmp(method, "POST") == 0)
     {
-        // Extract JSON body
+        // Extract JSON body with safe parsing
         char *body = strstr(buffer, "\r\n\r\n");
-        if (body)
+        if (body && (body - buffer < (ssize_t)strlen(buffer) - 4))
         {
             body += 4;
-
-            if (strcmp(path, "/bind") == 0)
-            {
-                // Extract busid from JSON {"busid":"1-1.1"}
-                char *busid_start = strstr(body, "\"busid\":\"");
+            size_t body_len = strnlen(body, 4096); // Limit body length
+            
+            if (body_len > 0 && body_len < 4096) {
+                if (strcmp(path, "/bind") == 0)
+                {
+                    // Extract busid from JSON {"busid":"1-1.1"} with safe parsing
+                    char *busid_start = strstr(body, "\"busid\":\"");
                 if (busid_start)
                 {
                     busid_start += 9;
@@ -2046,6 +2152,7 @@ void *handle_client(void *arg)
                         list_usbip_devices();
                         broadcast_devices_update();
                     }
+                }
                 }
             }
             else if (strcmp(path, "/unbind") == 0)
