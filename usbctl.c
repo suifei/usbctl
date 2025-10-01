@@ -1,16 +1,9 @@
 /*
  * usbctl - USB/IP Device Web Manager
- * A lightweight single-file web interface for USB/IP device management
+ * Security-hardened cross-platform implementation
  *
- * Features:
- * - Single executable file
- * - Embedded HTML/CSS/JS resources
- * - Configuration persistence
- * - Real-time Server-Sent Events updates
- * - AJAX-based device operations
- * - ARM Linux optimized
- *
- * Build: gcc -static -O2 -o usbctl usbctl.c -lpthread
+ * Build Linux:   gcc -O2 -o usbctl usbctl.c -lpthread -Wall -Wextra
+ * Build Windows: gcc -O2 -o usbctl.exe usbctl.c -lws2_32 -Wall -Wextra
  * Usage: sudo ./usbctl [options]
  */
 
@@ -20,48 +13,30 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <direct.h>
-#include <io.h>
-#include <sys/stat.h>
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <process.h>
 #include <io.h>
-#ifdef _MSC_VER
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "pthread")
-#endif
-// Windows socket compatibility
+#include <direct.h>
+// Link with ws2_32 using -lws2_32 flag instead of pragma
 #define close(s) closesocket(s)
 #define ssize_t int
-#define sleep(x) Sleep(x * 1000)
-// Note: popen/pclose usage controlled by secure_exec_command function
+#define sleep(x) Sleep((x) * 1000)
 #define mkdir(path, mode) _mkdir(path)
-#define PATH_SEPARATOR "\\"
-// Windows-specific missing definitions
 #define MSG_NOSIGNAL 0
 #define SIGPIPE 13
 #define WEXITSTATUS(w) (((w) >> 8) & 0xff)
-// Windows stat compatibility
 #ifndef S_ISREG
 #define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
 #endif
 #ifndef S_IXUSR  
 #define S_IXUSR _S_IEXEC
 #endif
-// Signal handling compatibility
-struct sigaction
-{
-    void (*sa_handler)(int);
-    int sa_flags;
-    int sa_mask;
-};
-#define sigemptyset(set) (*(set) = 0)
-#define sigaction(sig, act, oact) signal(sig, (act)->sa_handler)
+typedef void (*sighandler_t)(int);
+#define signal_compat(sig, handler) signal(sig, handler)
 #else
 #define PLATFORM_UNIX
-// Enable POSIX/GNU extensions for readlink and others before any headers
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -74,19 +49,65 @@ struct sigaction
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#define PATH_SEPARATOR "/"
+#define signal_compat(sig, handler) signal(sig, handler)
 #endif
 
 // Common headers
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+// Pthread on Windows requires special handling
+#ifdef PLATFORM_WINDOWS
+#include <windows.h>
+typedef HANDLE pthread_t;
+typedef CRITICAL_SECTION pthread_mutex_t;
+#define PTHREAD_MUTEX_INITIALIZER {0}
+#define pthread_mutex_lock(m) EnterCriticalSection(m)
+#define pthread_mutex_unlock(m) LeaveCriticalSection(m)
+
+// Windows thread wrapper to match pthread signature
+typedef struct {
+    void *(*start_routine)(void *);
+    void *arg;
+} thread_wrapper_t;
+
+static DWORD WINAPI thread_wrapper(LPVOID param) {
+    thread_wrapper_t *wrapper = (thread_wrapper_t *)param;
+    void *(*start)(void *) = wrapper->start_routine;
+    void *arg = wrapper->arg;
+    free(wrapper);
+    start(arg);
+    return 0;
+}
+
+static inline int pthread_create(pthread_t *thread, void *attr, void *(*start)(void *), void *arg) {
+    (void)attr;
+    thread_wrapper_t *wrapper = malloc(sizeof(thread_wrapper_t));
+    if (!wrapper) return -1;
+    wrapper->start_routine = start;
+    wrapper->arg = arg;
+    *thread = CreateThread(NULL, 0, thread_wrapper, wrapper, 0, NULL);
+    return *thread ? 0 : -1;
+}
+static inline int pthread_join(pthread_t thread, void **retval) {
+    (void)retval;
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    return 0;
+}
+static inline int pthread_detach(pthread_t thread) {
+    CloseHandle(thread);
+    return 0;
+}
+#else
+#include <pthread.h>
+#endif
 
 #define VERSION "1.0.0"
 #define AUTHOR "github.com/suifei"
@@ -98,48 +119,37 @@ struct sigaction
 #define MAX_DEVICES 32
 #define MAX_LSUSB_ENTRIES 64
 #define LOG_BUFFER_SIZE 1024
-#define JSON_BUFFER_SIZE 8192  // Increased buffer size for JSON responses
+#define JSON_BUFFER_SIZE 8192
 
 // Configuration structure
-typedef struct
-{
+typedef struct {
     int port;
     char bind_address[64];
     int poll_interval;
     char config_path[CONFIG_PATH_SIZE];
     int verbose_logging;
     char log_file[256];
-    char bound_devices[MAX_DEVICES][16]; // Array to store bound device busids
+    char bound_devices[MAX_DEVICES][16];
     int bound_devices_count;
 } config_t;
 
-// Function declarations (forward declarations)
-void update_bound_devices_config();
-void restore_bound_devices();
-int bind_device(const char *busid);
-int unbind_device(const char *busid);
-int exec_command(const char *cmd, char *output, size_t output_size);
-
-// HTTP响应函数声明
-void send_http_response(int client_socket, int status_code, const char *status_text, const char *content_type,
-                        const char *body);
-
 // USB device structure
-typedef struct
-{
+typedef struct {
     char busid[16];
     char info[256];
     int bound;
 } usb_device_t;
-// Structure to map USB VID:PID to human-readable description
-typedef struct
-{
-    char id[16];    // e.g., "303a:1001"
-    char desc[256]; // e.g., "Espressif USB JTAG/serial debug unit"
+
+#ifndef PLATFORM_WINDOWS
+// Structure to map USB VID:PID to human-readable description (Linux only)
+typedef struct {
+    char id[16];
+    char desc[256];
 } lsusb_entry_t;
+#endif
+
 // SSE client structure
-typedef struct
-{
+typedef struct {
     int socket;
     int is_sse;
     struct sockaddr_in addr;
@@ -149,10 +159,10 @@ typedef struct
 // Global variables
 static config_t g_config = {DEFAULT_PORT, DEFAULT_BIND, 3, "", 1, "/var/log/usbctl.log", {""}, 0};
 static usb_device_t g_devices[MAX_DEVICES];
-// Global cache for lsusb data
+#ifndef PLATFORM_WINDOWS
 static lsusb_entry_t g_lsusb_map[MAX_LSUSB_ENTRIES];
 static int g_lsusb_count = 0;
-
+#endif
 static int g_device_count = 0;
 static client_t g_clients[MAX_CLIENTS];
 static int g_client_count = 0;
@@ -162,11 +172,18 @@ static volatile int g_server_started = 0;
 static FILE *g_log_file = NULL;
 static int g_usbip_error_shown = 0;
 
+// Forward declarations
+void update_bound_devices_config(void);
+void restore_bound_devices(void);
+int bind_device(const char *busid);
+int unbind_device(const char *busid);
+void send_http_response(int client_socket, int status_code, const char *status_text, 
+                       const char *content_type, const char *body);
+
 // ============================================================================
-// EMBEDDED WEB RESOURCES (Minimized and optimized)
+// EMBEDDED WEB RESOURCES
 // ============================================================================
 
-// Embedded Logo SVG
 const char *LOGO_SVG = "<svg width=\"64\" height=\"64\" viewBox=\"0 0 64 64\" "
                        "xmlns=\"http://www.w3.org/2000/svg\">"
                        "<rect x=\"12\" y=\"24\" width=\"24\" height=\"16\" rx=\"2\" "
@@ -176,125 +193,44 @@ const char *LOGO_SVG = "<svg width=\"64\" height=\"64\" viewBox=\"0 0 64 64\" "
                        "<path d=\"M40 32 L52 32\" stroke=\"#007BFF\" stroke-width=\"3\" "
                        "stroke-linecap=\"round\"/>"
                        "<circle cx=\"52\" cy=\"32\" r=\"6\" fill=\"#28a745\" "
-                       "stroke=\"#1e7e34\" "
-                       "stroke-width=\"2\"/>"
+                       "stroke=\"#1e7e34\" stroke-width=\"2\"/>"
                        "<circle cx=\"52\" cy=\"32\" r=\"2\" fill=\"#fff\"/>"
                        "</svg>";
 
-// Embedded favicon.ico (base64 encoded 16x16 USB connector icon - blue and
-// green design like SVG logo)
-static const char *EMBEDDED_FAVICON = "AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAAAQAABILAAASCwA"
-                                      "AAA"
-                                      "AAAAAAAAD"
-                                      "///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A//"
-                                      "//"
-                                      "AP///wD///8A"
-                                      "////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP/"
-                                      "//"
-                                      "wD///8A////AP"
-                                      "///wD///8A////AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD//"
-                                      "/"
-                                      "8A////AP///wD/"
-                                      "//8A////AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A///"
-                                      "/"
-                                      "AP///wD///8A///"
-                                      "/AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///"
-                                      "wD//"
-                                      "/8A////AP//"
-                                      "/wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///wD///"
-                                      "8A//"
-                                      "//AP///wAH"
-                                      "tP8AB7T/AAe0/wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A///"
-                                      "/"
-                                      "AP///wAHtP8A"
-                                      "B7T/AAe0/wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP/"
-                                      "//"
-                                      "wD///8A////"
-                                      "AP///wD///8A////AP///wAoqAAAs+0AAP///wD///8A////AP///wD///8A////AP///"
-                                      "wD///"
-                                      "8A////AP//"
-                                      "/wD///8A////ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///"
-                                      "8A//"
-                                      "//AP///wD/"
-                                      "//8A////ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A///"
-                                      "/"
-                                      "AP///wD///8A"
-                                      "////ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP/"
-                                      "//"
-                                      "wD///8A///"
-                                      "/ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///"
-                                      "wD//"
-                                      "/8A////A"
-                                      "CoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD/"
-                                      "//"
-                                      "8A////ACo"
-                                      "qKgAoqAAA////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///"
-                                      "8A/"
-                                      "///AP///"
-                                      "wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///"
-                                      "8AAAAAAAAAAAAA"
-                                      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-                                      "AAA"
-                                      "AA=";
+static const char *EMBEDDED_FAVICON = "AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAAAQAABILAAASCwAAAAAAAAAAAAD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///wD///8A////AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///wD///8A////AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///wD///8A////AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///wD///8A////AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wAHtP8AB7T/AAe0/wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wAoqAAAs+0AAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////ACoqKgAoqAAAKKgAAP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////ACoqKgAoqAAA////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8A////AP///wD///8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
-// Embedded CSS (Ultra-compact responsive design with modern aesthetics)
 static const char *EMBEDDED_CSS = "*{margin:0;padding:0;box-sizing:border-box}"
-                                  "body{font:14px/1.4 "
-                                  "system-ui,-apple-system,sans-serif;background:#f8f9fa;color:#333;"
-                                  "padding:"
-                                  "10px;padding-bottom:220px}"
-                                  "header{text-align:center;margin-bottom:20px;padding:10px;background:"
-                                  "linear-gradient(135deg,#007bff,#6610f2);color:#fff;border-radius:8px}"
+                                  "body{font:14px/1.4 system-ui,-apple-system,sans-serif;background:#f8f9fa;color:#333;padding:10px;padding-bottom:220px}"
+                                  "header{text-align:center;margin-bottom:20px;padding:10px;background:linear-gradient(135deg,#007bff,#6610f2);color:#fff;border-radius:8px}"
                                   ".logo{width:32px;height:32px;margin:0 8px;vertical-align:middle}"
                                   "h1{font-size:24px;margin:5px 0}"
                                   ".controls{text-align:center;margin-bottom:15px}"
-                                  ".lang-btn{background:#28a745;color:#fff;border:none;padding:4px "
-                                  "8px;border-radius:4px;margin:0 2px;cursor:pointer;font-size:11px}"
+                                  ".lang-btn{background:#28a745;color:#fff;border:none;padding:4px 8px;border-radius:4px;margin:0 2px;cursor:pointer;font-size:11px}"
                                   ".lang-btn.active{background:#155724}"
                                   ".main-content{margin-bottom:20px}"
-                                  "table{width:100%;border-collapse:collapse;background:#fff;border-"
-                                  "radius:"
-                                  "8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1)}"
-                                  "th,td{padding:8px 12px;text-align:left;border-bottom:1px solid "
-                                  "#dee2e6;font-size:13px}"
+                                  "table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1)}"
+                                  "th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #dee2e6;font-size:13px}"
                                   "th{background:#007bff;color:#fff;font-weight:600;position:sticky;top:0}"
                                   "tr:hover{background:#f8f9fa}"
-                                  ".status{font-weight:600;padding:2px "
-                                  "6px;border-radius:3px;font-size:11px}"
+                                  ".status{font-weight:600;padding:2px 6px;border-radius:3px;font-size:11px}"
                                   ".bound{background:#d4edda;color:#155724}"
                                   ".unbound{background:#f8d7da;color:#721c24}"
-                                  "button{padding:4px "
-                                  "8px;border:none;border-radius:3px;cursor:pointer;font-size:11px;"
-                                  "transition:all 0.2s}"
+                                  "button{padding:4px 8px;border:none;border-radius:3px;cursor:pointer;font-size:11px;transition:all 0.2s}"
                                   ".btn-bind{background:#28a745;color:#fff}"
                                   ".btn-unbind{background:#dc3545;color:#fff}"
                                   ".btn-bind:hover{background:#218838}"
                                   ".btn-unbind:hover{background:#c82333}"
-                                  "#status{position:fixed;top:10px;right:10px;padding:4px "
-                                  "8px;background:#17a2b8;color:#fff;border-radius:4px;font-size:11px;z-"
-                                  "index:1000}"
-                                  ".footer{position:fixed;bottom:0;left:0;right:0;text-align:center;font-"
-                                  "size:11px;color:#6c757d;background:rgba(248,249,250,0.98);padding:8px "
-                                  "15px;border-top:1px solid "
-                                  "#dee2e6;backdrop-filter:blur(10px);z-index:999}"
+                                  "#status{position:fixed;top:10px;right:10px;padding:4px 8px;background:#17a2b8;color:#fff;border-radius:4px;font-size:11px;z-index:1000}"
+                                  ".footer{position:fixed;bottom:0;left:0;right:0;text-align:center;font-size:11px;color:#6c757d;background:rgba(248,249,250,0.98);padding:8px 15px;border-top:1px solid #dee2e6;backdrop-filter:blur(10px);z-index:999}"
                                   ".footer a{color:#007bff;text-decoration:none}"
-                                  ".log-container{position:fixed;bottom:40px;left:0;right:0;height:150px;"
-                                  "background:#fff;border-top:2px solid #007bff;box-shadow:0 -2px 10px "
-                                  "rgba(0,0,0,0.1);z-index:998}"
-                                  ".log-header{display:flex;justify-content:space-between;align-items:"
-                                  "center;"
-                                  "padding:8px 15px;background:#f8f9fa;border-bottom:1px solid #dee2e6}"
+                                  ".log-container{position:fixed;bottom:40px;left:0;right:0;height:150px;background:#fff;border-top:2px solid #007bff;box-shadow:0 -2px 10px rgba(0,0,0,0.1);z-index:998}"
+                                  ".log-header{display:flex;justify-content:space-between;align-items:center;padding:8px 15px;background:#f8f9fa;border-bottom:1px solid #dee2e6}"
                                   ".log-title{font-weight:600;color:#333;font-size:13px}"
-                                  ".clear-log-btn{background:#6c757d;color:#fff;padding:3px "
-                                  "8px;border:none;border-radius:3px;cursor:pointer;font-size:11px}"
+                                  ".clear-log-btn{background:#6c757d;color:#fff;padding:3px 8px;border:none;border-radius:3px;cursor:pointer;font-size:11px}"
                                   ".clear-log-btn:hover{background:#5a6268}"
-                                  ".log-content{height:calc(150px - "
-                                  "40px);overflow-y:auto;padding:8px;font-family:monospace;font-size:12px;"
-                                  "line-height:1.3}"
-                                  ".log-entry{margin-bottom:4px;padding:2px 0;border-left:3px solid "
-                                  "transparent;padding-left:8px}"
-                                  ".log-success{color:#155724;border-left-color:#28a745;background:#"
-                                  "d4edda}"
+                                  ".log-content{height:calc(150px - 40px);overflow-y:auto;padding:8px;font-family:monospace;font-size:12px;line-height:1.3}"
+                                  ".log-entry{margin-bottom:4px;padding:2px 0;border-left:3px solid transparent;padding-left:8px}"
+                                  ".log-success{color:#155724;border-left-color:#28a745;background:#d4edda}"
                                   ".log-error{color:#721c24;border-left-color:#dc3545;background:#f8d7da}"
                                   ".log-info{color:#0c5460;border-left-color:#17a2b8;background:#d1ecf1}"
                                   ".log-timestamp{color:#6c757d;font-size:10px}"
@@ -312,182 +248,32 @@ static const char *EMBEDDED_CSS = "*{margin:0;padding:0;box-sizing:border-box}"
                                   ".log-title{font-size:12px}"
                                   "}";
 
-// Embedded JavaScript (Ultra-optimized with smart i18n)
 const char *EMBEDDED_JS = "let eventSource,devices=[],lang='en',logEntries=[];"
-                          "const i18n={'en':{'title':'USB/IP Manager','device':'Device "
-                          "Info','busid':'Bus "
-                          "ID','status':'Status','action':'Action','bound':'Bound','unbound':'"
-                          "Unbound','bind':'Bind','unbind':'Unbind','connected':'Connected','"
-                          "disconnected':'Disconnected','error':'Error','author':'Author','log_"
-                          "title'"
-                          ":'Operation Log','clear':'Clear','bind_success':'Device {busid} bound "
-                          "successfully','unbind_success':'Device {busid} unbound "
-                          "successfully','bind_error':'Error binding device {busid}: "
-                          "{error}','unbind_error':'Error unbinding device {busid}: "
-                          "{error}'},'zh':{'title':'USB/IP "
-                          "管理器','device':'设备信息','busid':'总线ID','status':'状态','action':'"
-                          "操作','bound':'已绑定','unbound':'未绑定','bind':'绑定','unbind':'解绑'"
-                          ",'"
-                          "connected':'已连接','disconnected':'已断开','error':'错误','author':'"
-                          "作者'"
-                          ",'log_title':'操作日志','clear':'清除','bind_success':'设备 {busid} "
-                          "绑定成功','unbind_success':'设备 {busid} "
-                          "解绑成功','bind_error':'绑定设备 "
-                          "{busid} 失败: {error}','unbind_error':'解绑设备 {busid} 失败: "
-                          "{error}'}};"
-                          "function detectLang(){"
-                          "try{"
-                          "const stored=localStorage.getItem('usbctl_lang');"
-                          "if(stored&&i18n[stored])return stored;"
-                          "const "
-                          "nav=navigator.language||navigator.userLanguage||navigator."
-                          "browserLanguage|"
-                          "|'en';"
-                          "const langCode=nav.toLowerCase();"
-                          "if(langCode.startsWith('zh')||langCode.includes('chinese')||langCode."
-                          "includes('cn'))return 'zh';"
-                          "return 'en';"
-                          "}catch(e){return 'en';}"
-                          "}"
-                          "function t(k,vars){let "
-                          "text=i18n[lang][k]||k;if(vars){Object.keys(vars).forEach(key=>{text="
-                          "text."
-                          "replace(`{${key}}`,vars[key]);})}return text;}"
-                          "function "
-                          "setLang(l){lang=l;localStorage.setItem('usbctl_lang',l);updateUI();}"
-                          "function updateUI(){"
-                          "document.title=`usbctl - ${t('title')}`;"
-                          "document.querySelector('h1').textContent=t('title');"
-                          "document.documentElement.lang=lang==='zh'?'zh-CN':'en';"
-                          "const ths=document.querySelectorAll('th');"
-                          "if(ths.length>=4){ths[0].textContent=t('device');ths[1].textContent=t('"
-                          "busid');ths[2].textContent=t('status');ths[3].textContent=t('action');}"
-                          "document.querySelectorAll('.lang-btn').forEach(b=>b.classList.toggle('"
-                          "active',b.dataset.lang===lang));"
-                          "const logTitle=document.querySelector('.log-title');"
-                          "if(logTitle)logTitle.textContent=t('log_title');"
-                          "const clearBtn=document.querySelector('.clear-log-btn');"
-                          "if(clearBtn)clearBtn.textContent=t('clear');"
-                          "render();renderLog();"
-                          "}"
-                          "function connectSSE(){"
-                          "if(eventSource)eventSource.close();"
-                          "eventSource=new EventSource('/events');"
-                          "eventSource.onopen=()=>document.getElementById('status').textContent=t("
-                          "'"
-                          "connected');"
-                          "eventSource.onmessage=e=>{"
-                          "try{devices=JSON.parse(e.data);render();}catch(err){console.error(err);"
-                          "}"
-                          "};"
-                          "eventSource.onerror=()=>{"
-                          "document.getElementById('status').textContent=t('disconnected');"
-                          "setTimeout(connectSSE,3000);"
-                          "};"
-                          "}"
-                          "function render(){"
-                          "const tbody=document.querySelector('tbody');"
-                          "tbody.innerHTML=devices.map(d=>"
-                          "`<tr><td>${d.info}</td><td><code>${d.busid}</code></td>`+"
-                          "`<td><span class=\"status "
-                          "${d.bound?'bound':'unbound'}\">${t(d.bound?'bound':'unbound')}</span></"
-                          "td>`+"
-                          "`<td><button class=\"${d.bound?'btn-unbind':'btn-bind'}\" "
-                          "onclick=\"toggle('${d.busid}')\">`+"
-                          "`${t(d.bound?'unbind':'bind')}</button></td></tr>`).join('');"
-                          "}"
-                          "function addLog(type,message){"
-                          "const timestamp=new Date().toLocaleTimeString();"
-                          "const entry={type,message,timestamp};"
-                          "logEntries.unshift(entry);"
-                          "if(logEntries.length>100)logEntries.pop();"
-                          "renderLog();"
-                          "}"
-                          "function renderLog(){"
-                          "const logContent=document.getElementById('logContent');"
-                          "if(!logContent)return;"
-                          "logContent.innerHTML=logEntries.map(entry=>"
-                          "`<div class=\"log-entry log-${entry.type}\">`+"
-                          "`<span class=\"log-timestamp\">[${entry.timestamp}]</span> "
-                          "${entry.message}`+"
-                          "`</div>`).join('');"
-                          "logContent.scrollTop=0;"
-                          "}"
-                          "function clearLog(){"
-                          "logEntries=[];"
-                          "renderLog();"
-                          "}"
-                          "function toggle(busid){"
-                          "const device=devices.find(d=>d.busid===busid);"
-                          "if(!device)return;"
-                          "const button=event.target;"
-                          "const action=device.bound?'unbind':'bind';"
-                          "button.disabled=true;"
-                          "fetch(`/${action}`,{method:'POST',headers:{'Content-Type':'application/"
-                          "json'},"
-                          "body:JSON.stringify({busid})})"
-                          ".then(response=>{"
-                          "if(response.ok){"
-                          "return response.json().then(data=>{"
-                          "addLog('success',t(`${action}_success`,{busid}));"
-                          "if(data.devices){"
-                          "devices=data.devices;"
-                          "render();"
-                          "}else{"
-                          "loadDevices();"
-                          "}"
-                          "});"
-                          "}else{"
-                          "return response.text().then(text=>{"
-                          "let errorMsg='Unknown error';"
-                          "try{"
-                          "const data=JSON.parse(text);"
-                          "if(data.error){"
-                          "errorMsg=data.error.trim();"
-                          "const errorMatch=errorMsg.match(/error[:\\s]*(.+?)(?:\\n|$)/i);"
-                          "if(errorMatch)errorMsg=errorMatch[1];"
-                          "}"
-                          "}catch(e){"
-                          "const errorMatch=text.match(/error[:\\s]*(.+?)(?:\\n|$)/i);"
-                          "if(errorMatch)errorMsg=errorMatch[1];"
-                          "}"
-                          "addLog('error',t(`${action}_error`,{busid,error:errorMsg}));"
-                          "throw new Error(errorMsg);"
-                          "});"
-                          "}"
-                          "})"
-                          ".catch(err=>{"
-                          "console.error(err);"
-                          "})"
-                          ".finally(()=>button.disabled=false);"
-                          "}"
-                          "function loadDevices(){"
-                          "fetch('/api/"
-                          "devices').then(r=>r.json()).then(data=>{devices=data;render()}).catch("
-                          "console.error);"
-                          "}"
-                          "window.onload=()=>{"
-                          "lang=detectLang();"
-                          "updateUI();connectSSE();loadDevices();"
-                          "};";
+                          "const i18n={'en':{'title':'USB/IP Manager','device':'Device Info','busid':'Bus ID','status':'Status','action':'Action','bound':'Bound','unbound':'Unbound','bind':'Bind','unbind':'Unbind','connected':'Connected','disconnected':'Disconnected','error':'Error','author':'Author','log_title':'Operation Log','clear':'Clear','bind_success':'Device {busid} bound successfully','unbind_success':'Device {busid} unbound successfully','bind_error':'Error binding device {busid}: {error}','unbind_error':'Error unbinding device {busid}: {error}'},'zh':{'title':'USB/IP 管理器','device':'设备信息','busid':'总线ID','status':'状态','action':'操作','bound':'已绑定','unbound':'未绑定','bind':'绑定','unbind':'解绑','connected':'已连接','disconnected':'已断开','error':'错误','author':'作者','log_title':'操作日志','clear':'清除','bind_success':'设备 {busid} 绑定成功','unbind_success':'设备 {busid} 解绑成功','bind_error':'绑定设备 {busid} 失败: {error}','unbind_error':'解绑设备 {busid} 失败: {error}'}};"
+                          "function detectLang(){try{const stored=localStorage.getItem('usbctl_lang');if(stored&&i18n[stored])return stored;const nav=navigator.language||navigator.userLanguage||navigator.browserLanguage||'en';const langCode=nav.toLowerCase();if(langCode.startsWith('zh')||langCode.includes('chinese')||langCode.includes('cn'))return 'zh';return 'en';}catch(e){return 'en';}}"
+                          "function t(k,vars){let text=i18n[lang][k]||k;if(vars){Object.keys(vars).forEach(key=>{text=text.replace(`{${key}}`,vars[key]);})}return text;}"
+                          "function setLang(l){lang=l;localStorage.setItem('usbctl_lang',l);updateUI();}"
+                          "function updateUI(){document.title=`usbctl - ${t('title')}`;document.querySelector('h1').textContent=t('title');document.documentElement.lang=lang==='zh'?'zh-CN':'en';const ths=document.querySelectorAll('th');if(ths.length>=4){ths[0].textContent=t('device');ths[1].textContent=t('busid');ths[2].textContent=t('status');ths[3].textContent=t('action');}document.querySelectorAll('.lang-btn').forEach(b=>b.classList.toggle('active',b.dataset.lang===lang));const logTitle=document.querySelector('.log-title');if(logTitle)logTitle.textContent=t('log_title');const clearBtn=document.querySelector('.clear-log-btn');if(clearBtn)clearBtn.textContent=t('clear');render();renderLog();}"
+                          "function connectSSE(){if(eventSource)eventSource.close();eventSource=new EventSource('/events');eventSource.onopen=()=>document.getElementById('status').textContent=t('connected');eventSource.onmessage=e=>{try{devices=JSON.parse(e.data);render();}catch(err){console.error(err);}};eventSource.onerror=()=>{document.getElementById('status').textContent=t('disconnected');setTimeout(connectSSE,3000)};}"
+                          "function render(){const tbody=document.querySelector('tbody');tbody.innerHTML=devices.map(d=>`<tr><td>${d.info}</td><td><code>${d.busid}</code></td>`+`<td><span class=\"status ${d.bound?'bound':'unbound'}\">${t(d.bound?'bound':'unbound')}</span></td>`+`<td><button class=\"${d.bound?'btn-unbind':'btn-bind'}\" onclick=\"toggle('${d.busid}')\">`+`${t(d.bound?'unbind':'bind')}</button></td></tr>`).join('');}"
+                          "function addLog(type,message){const timestamp=new Date().toLocaleTimeString();const entry={type,message,timestamp};logEntries.unshift(entry);if(logEntries.length>100)logEntries.pop();renderLog();}"
+                          "function renderLog(){const logContent=document.getElementById('logContent');if(!logContent)return;logContent.innerHTML=logEntries.map(entry=>`<div class=\"log-entry log-${entry.type}\">`+`<span class=\"log-timestamp\">[${entry.timestamp}]</span> ${entry.message}`+`</div>`).join('');logContent.scrollTop=0;}"
+                          "function clearLog(){logEntries=[];renderLog();}"
+                          "function toggle(busid){const device=devices.find(d=>d.busid===busid);if(!device)return;const button=event.target;const action=device.bound?'unbind':'bind';button.disabled=true;fetch(`/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({busid})}).then(response=>{if(response.ok){return response.json().then(data=>{addLog('success',t(`${action}_success`,{busid}));if(data.devices){devices=data.devices;render();}else{loadDevices();}});}else{return response.text().then(text=>{let errorMsg='Unknown error';try{const data=JSON.parse(text);if(data.error){errorMsg=data.error.trim();const errorMatch=errorMsg.match(/error[:\\s]*(.+?)(?:\\n|$)/i);if(errorMatch)errorMsg=errorMatch[1];}}catch(e){const errorMatch=text.match(/error[:\\s]*(.+?)(?:\\n|$)/i);if(errorMatch)errorMsg=errorMatch[1];}addLog('error',t(`${action}_error`,{busid,error:errorMsg}));throw new Error(errorMsg);});}}).catch(err=>{console.error(err);}).finally(()=>button.disabled=false);}"
+                          "function loadDevices(){fetch('/api/devices').then(r=>r.json()).then(data=>{devices=data;render()}).catch(console.error);}"
+                          "window.onload=()=>{lang=detectLang();updateUI();connectSSE();loadDevices();};";
 
-// Embedded HTML (Optimized responsive template)
 const char *EMBEDDED_HTML = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
-                            "<meta name=\"viewport\" "
-                            "content=\"width=device-width,initial-scale=1,user-scalable=no\">"
+                            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,user-scalable=no\">"
                             "<title>usbctl - USB/IP Manager</title><style>%s</style></head><body>"
-                            "<header><div class=\"logo\">%s</div><h1>USB/IP Manager</h1>"
-                            "</header>"
+                            "<header><div class=\"logo\">%s</div><h1>USB/IP Manager</h1></header>"
                             "<div class=\"controls\">"
-                            "<button class=\"lang-btn active\" data-lang=\"en\" "
-                            "onclick=\"setLang('en')\">English</button>"
-                            "<button class=\"lang-btn\" data-lang=\"zh\" "
-                            "onclick=\"setLang('zh')\">中文</button>"
+                            "<button class=\"lang-btn active\" data-lang=\"en\" onclick=\"setLang('en')\">English</button>"
+                            "<button class=\"lang-btn\" data-lang=\"zh\" onclick=\"setLang('zh')\">中文</button>"
                             "</div>"
                             "<div id=\"status\">Connecting...</div>"
                             "<div class=\"main-content\">"
-                            "<table><thead><tr><th>Device Info</th><th>Bus "
-                            "ID</th><th>Status</th><th>Action</th></tr></thead>"
+                            "<table><thead><tr><th>Device Info</th><th>Bus ID</th><th>Status</th><th>Action</th></tr></thead>"
                             "<tbody></tbody></table>"
                             "</div>"
                             "<div class=\"log-container\">"
@@ -497,128 +283,130 @@ const char *EMBEDDED_HTML = "<!DOCTYPE html><html lang=\"en\"><head><meta charse
                             "</div>"
                             "<div class=\"log-content\" id=\"logContent\"></div>"
                             "</div>"
-                            "<div class=\"footer\">Powered by <a "
-                            "href=\"https://github.com/suifei/usbctl\" target=\"_blank\">usbctl "
-                            "v" VERSION "</a> | "
-                            "<a href=\"https://github.com/suifei\" "
-                            "target=\"_blank\">github.com/suifei</a></div>"
+                            "<div class=\"footer\">Powered by <a href=\"https://github.com/suifei/usbctl\" target=\"_blank\">usbctl v" VERSION "</a> | "
+                            "<a href=\"https://github.com/suifei\" target=\"_blank\">github.com/suifei</a></div>"
                             "<script>%s</script></body></html>";
 
 // ============================================================================
-// FORWARD DECLARATIONS
+// UTILITY FUNCTIONS
 // ============================================================================
 
-void log_message(const char *level, const char *format, ...);
-
-// Secure command execution function
-static int secure_exec_command(const char *cmd, char *output, size_t output_size);
-
-// Validate command for safety (basic sanitization)
-static int validate_command(const char *cmd);
-
-// Safe strnlen implementation for systems that don't have it
-#ifndef HAVE_STRNLEN
+// Safe string length with maximum bound
 static size_t safe_strnlen(const char *s, size_t maxlen) {
     if (!s) return 0;
     const char *p = s;
     while (maxlen-- > 0 && *p) p++;
     return p - s;
 }
-#define strnlen safe_strnlen
-#endif
 
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
+// Initialize logging system
+int init_logging(void) {
+    if (!g_config.verbose_logging) {
+        g_log_file = fopen("/dev/null", "w");
+        return g_log_file != NULL;
+    }
 
-// Safe file existence check without TOCTOU race condition
-static int safe_file_exists(const char *path) {
-    struct stat st;
-    return (stat(path, &st) == 0);
-}
-
-// Safe executable check without TOCTOU race condition  
-static int safe_executable_exists(const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) {
-        return 0;
+    g_log_file = fopen(g_config.log_file, "a");
+    if (!g_log_file) {
+        g_log_file = stderr;
+        fprintf(stderr, "[WARN] Cannot open log file, using stderr\n");
     }
-    // Check if it's a regular file and executable
-    return S_ISREG(st.st_mode) && (st.st_mode & S_IXUSR);
-}
-
-// Validate environment variable content for safety
-static int validate_env_path(const char *path) {
-    if (!path) {
-        return 0;
-    }
-    
-    // Safe length check to prevent potential over-read
-    size_t len = strnlen(path, 2048);  // Use strnlen for safety
-    if (len == 0 || len >= 2048) {
-        log_message("WARN", "Environment path invalid length, using default");
-        return 0;
-    }
-    
-    // Check for dangerous characters
-    const char *dangerous = "\r\n\0";
-    for (const char *p = dangerous; *p; p++) {
-        // Use memchr for safer character search
-        if (memchr(path, *p, len)) {
-            log_message("WARN", "Dangerous character in environment path, using default");
-            return 0;
-        }
-    }
-    
     return 1;
 }
 
-// Validate command for safety (basic sanitization)
-static int validate_command(const char *cmd) {
-    if (!cmd) return 0;
+// Log message with timestamp - format string vulnerability fixed
+void log_message(const char *level, const char *format, ...) {
+    if (!g_log_file || !level || !format)
+        return;
+
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+
+    // Sanitize level parameter
+    char safe_level[16];
+    size_t level_len = safe_strnlen(level, sizeof(safe_level) - 1);
+    if (level_len >= sizeof(safe_level)) {
+        memcpy(safe_level, "TOOLONG", 7);
+        safe_level[7] = '\0';
+    } else {
+        memcpy(safe_level, level, level_len);
+        safe_level[level_len] = '\0';
+    }
+
+    fprintf(g_log_file, "[%s] %s: ", timestamp, safe_level);
+
+    va_list args;
+    va_start(args, format);
+    vfprintf(g_log_file, format, args);
+    va_end(args);
+
+    fprintf(g_log_file, "\n");
+    fflush(g_log_file);
+}
+
+// Validate busid format
+static int validate_busid(const char *busid) {
+    if (!busid) return 0;
     
-    // Check for dangerous characters that could enable command injection
-    const char *dangerous_chars = ";|&`$(){}[]<>";
-    for (const char *p = dangerous_chars; *p; p++) {
-        if (strchr(cmd, *p)) {
-            log_message("ERROR", "Dangerous character found in command");
+    size_t len = safe_strnlen(busid, 64);
+    if (len == 0 || len >= 64) return 0;
+    
+    // busid format: number-number.number (e.g., "1-1.2")
+    for (size_t i = 0; i < len; i++) {
+        char c = busid[i];
+        if (!((c >= '0' && c <= '9') || c == '-' || c == '.')) {
             return 0;
         }
     }
+    return 1;
+}
+
+// Validate command for allowed list
+static int validate_command(const char *cmd) {
+    if (!cmd) return 0;
     
-    // Only allow specific commands we know are safe
+    // Platform-specific allowed commands
+#ifdef PLATFORM_WINDOWS
     const char *allowed_commands[] = {
-        "usbip", "lsusb", "systemctl", "modprobe", "usbipd", NULL
+        "usbipd", "usbip", NULL
     };
+#else
+    const char *allowed_commands[] = {
+        "usbip", "lsusb", "modprobe", NULL
+    };
+#endif
     
     for (int i = 0; allowed_commands[i]; i++) {
-        if (strncmp(cmd, allowed_commands[i], strlen(allowed_commands[i])) == 0) {
-            return 1;
+        size_t cmd_len = strlen(allowed_commands[i]);
+        if (strncmp(cmd, allowed_commands[i], cmd_len) == 0) {
+            // Ensure next char is space or null
+            if (cmd[cmd_len] == ' ' || cmd[cmd_len] == '\0') {
+                return 1;
+            }
         }
     }
     
-    log_message("ERROR", "Command not in allowed list");
     return 0;
 }
 
-// Secure command execution with enhanced validation
+// Secure command execution
 static int secure_exec_command(const char *cmd, char *output, size_t output_size) {
     if (!cmd || !output || output_size == 0) {
-        log_message("ERROR", "Invalid arguments for secure_exec_command");
+        log_message("ERROR", "Invalid arguments");
         return -1;
     }
     
-    // Validate command for safety
     if (!validate_command(cmd)) {
-        log_message("ERROR", "Command validation failed: %.*s", 50, cmd);
+        log_message("ERROR", "Command not allowed");
         return -1;
     }
     
-    // Clear output buffer
     memset(output, 0, output_size);
     
-    // Use CreateProcess on Windows for safer execution
-#ifdef _WIN32
+#ifdef PLATFORM_WINDOWS
+    // Windows: Use CreateProcess for secure execution
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(sa);
     sa.lpSecurityDescriptor = NULL;
@@ -630,7 +418,7 @@ static int secure_exec_command(const char *cmd, char *output, size_t output_size
         return -1;
     }
     
-    STARTUPINFO si;
+    STARTUPINFOA si;
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
@@ -639,10 +427,11 @@ static int secure_exec_command(const char *cmd, char *output, size_t output_size
     si.dwFlags |= STARTF_USESTDHANDLES;
     
     char cmd_copy[1024];
-    strncpy(cmd_copy, cmd, sizeof(cmd_copy) - 1);
-    cmd_copy[sizeof(cmd_copy) - 1] = '\0';
+    size_t cmd_len = safe_strnlen(cmd, sizeof(cmd_copy) - 1);
+    memcpy(cmd_copy, cmd, cmd_len);
+    cmd_copy[cmd_len] = '\0';
     
-    if (!CreateProcess(NULL, cmd_copy, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+    if (!CreateProcessA(NULL, cmd_copy, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
         CloseHandle(hRead);
         CloseHandle(hWrite);
         log_message("ERROR", "Failed to execute command");
@@ -664,7 +453,7 @@ static int secure_exec_command(const char *cmd, char *output, size_t output_size
     }
     output[totalRead] = '\0';
     
-    WaitForSingleObject(pi.hProcess, 5000); // 5 second timeout
+    WaitForSingleObject(pi.hProcess, 5000);
     DWORD exitCode;
     GetExitCodeProcess(pi.hProcess, &exitCode);
     
@@ -674,10 +463,10 @@ static int secure_exec_command(const char *cmd, char *output, size_t output_size
     
     return (int)exitCode;
 #else
-    // For Unix systems, use safer approach
+    // Unix/Linux: Use fork/exec for secure execution
     int pipefd[2];
     if (pipe(pipefd) == -1) {
-        log_message("ERROR", "Failed to create pipe");
+        log_message("ERROR", "Pipe creation failed");
         return -1;
     }
     
@@ -685,7 +474,7 @@ static int secure_exec_command(const char *cmd, char *output, size_t output_size
     if (pid == -1) {
         close(pipefd[0]);
         close(pipefd[1]);
-        log_message("ERROR", "Failed to fork process");
+        log_message("ERROR", "Fork failed");
         return -1;
     }
     
@@ -696,457 +485,238 @@ static int secure_exec_command(const char *cmd, char *output, size_t output_size
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
         
-        // Execute command safely
-        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        // Parse command safely
+        char *args[16];
+        int argc = 0;
+        char cmd_copy[256];
+        size_t cmd_len = safe_strnlen(cmd, sizeof(cmd_copy) - 1);
+        memcpy(cmd_copy, cmd, cmd_len);
+        cmd_copy[cmd_len] = '\0';
+        
+        char *token = strtok(cmd_copy, " ");
+        while (token && argc < 15) {
+            args[argc++] = token;
+            token = strtok(NULL, " ");
+        }
+        args[argc] = NULL;
+        
+        execvp(args[0], args);
         _exit(127);
-    } else {
-        // Parent process
-        close(pipefd[1]);
-        
-        size_t total = 0;
-        char buffer[256];
-        ssize_t bytesRead;
-        
-        while ((bytesRead = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0) {
-            if (total + bytesRead < output_size - 1) {
-                memcpy(output + total, buffer, bytesRead);
-                total += bytesRead;
-            } else {
-                break;
-            }
-        }
-        output[total] = '\0';
-        
-        close(pipefd[0]);
-        
-        int status;
-        waitpid(pid, &status, 0);
-        
-        // Only log command output during startup or if verbose logging enabled
-        if (!g_server_started || g_config.verbose_logging) {
-            log_message("DEBUG", "Command executed successfully");
-        }
-        
-        return WEXITSTATUS(status);
     }
+    
+    // Parent process
+    close(pipefd[1]);
+    
+    size_t total = 0;
+    char buffer[256];
+    ssize_t bytesRead;
+    
+    while ((bytesRead = read(pipefd[0], buffer, sizeof(buffer) - 1)) > 0) {
+        if (total + (size_t)bytesRead < output_size - 1) {
+            memcpy(output + total, buffer, bytesRead);
+            total += bytesRead;
+        } else {
+            break;
+        }
+    }
+    output[total] = '\0';
+    
+    close(pipefd[0]);
+    
+    int status;
+    waitpid(pid, &status, 0);
+    
+    return WEXITSTATUS(status);
 #endif
 }
 
-// ============================================================================
-// LOGGING AND SYSTEM COMPATIBILITY
-// ============================================================================
-
-// Initialize logging system
-int init_logging()
-{
-    if (!g_config.verbose_logging)
-    {
-        g_log_file = fopen("/dev/null", "w");
-        return g_log_file != NULL;
-    }
-
-    // Try to open log file
-    g_log_file = fopen(g_config.log_file, "a");
-    if (!g_log_file)
-    {
-        // Fallback to stderr
-        g_log_file = stderr;
-        fprintf(stderr, "[WARN] Cannot open log file %s, using stderr\n", g_config.log_file);
-    }
-    return 1;
-}
-
-// Log message with timestamp
-void log_message(const char *level, const char *format, ...)
-{
-    if (!g_log_file || !level || !format)
-        return;
-
-    time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
-    char timestamp[32];
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
-
-    // Sanitize level parameter to prevent format string attacks
-    char safe_level[16];
-    if (strnlen(level, sizeof(safe_level)) >= sizeof(safe_level)) {
-        strncpy(safe_level, "TOOLONG", sizeof(safe_level) - 1);
-    } else {
-        strncpy(safe_level, level, sizeof(safe_level) - 1);
-    }
-    safe_level[sizeof(safe_level) - 1] = '\0';
-
-    fprintf(g_log_file, "[%s] %s: ", timestamp, safe_level);
-
-    va_list args;
-    va_start(args, format);
-    vfprintf(g_log_file, format, args);
-    va_end(args);
-
-    fprintf(g_log_file, "\n");
-    fflush(g_log_file);
-}
-
-// ============================================================================
-// PLATFORM-SPECIFIC COMPATIBILITY FUNCTIONS
-// ============================================================================
-
-#ifdef PLATFORM_WINDOWS
-// Initialize Windows networking
-int init_windows_networking()
-{
-    WSADATA wsaData;
-    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (result != 0)
-    {
-        log_message("ERROR", "WSAStartup failed: %d", result);
+// Check if device is bound
+int is_device_bound(const char *busid) {
+    if (!validate_busid(busid)) {
         return 0;
     }
-    log_message("DEBUG", "Windows networking initialized");
-    return 1;
-}
-
-// Cleanup Windows networking
-void cleanup_windows_networking()
-{
-    WSACleanup();
-    log_message("DEBUG", "Windows networking cleaned up");
-}
-
-// Windows-compatible mkdir function (already defined as macro)
-// int mkdir_windows(const char *path) { return _mkdir(path); }
-
-// Windows-compatible readdir functionality
-// Note: For full Windows USB device enumeration, we would need to use
-// Windows-specific APIs like SetupAPI or WMI, which is beyond the scope
-// of a simple usbip wrapper. This would require significant additional code.
-
-#else // Unix/Linux platforms
-
-// Initialize Unix networking (no-op, but for consistency)
-int init_unix_networking()
-{
-    log_message("DEBUG", "Unix networking ready (no initialization required)");
-    return 1;
-}
-
-// Cleanup Unix networking (no-op)
-void cleanup_unix_networking()
-{
-    log_message("DEBUG", "Unix networking cleanup (no cleanup required)");
-}
-
-#endif
-
-// Cross-platform networking initialization
-int init_platform_networking()
-{
+    
 #ifdef PLATFORM_WINDOWS
-    return init_windows_networking();
+    // On Windows, we need to check via usbipd command
+    // For now, return 0 (not bound by default)
+    // Full implementation would query usbipd state
+    (void)busid;
+    return 0;
 #else
-    return init_unix_networking();
+    char path[256];
+    int ret = snprintf(path, sizeof(path), "/sys/bus/usb/drivers/usbip-host/%s", busid);
+    if (ret < 0 || ret >= (int)sizeof(path)) {
+        return 0;
+    }
+    
+    struct stat st;
+    return (stat(path, &st) == 0);
 #endif
 }
 
-// Cross-platform networking cleanup
-void cleanup_platform_networking()
-{
-#ifdef PLATFORM_WINDOWS
-    cleanup_windows_networking();
-#else
-    cleanup_unix_networking();
-#endif
-}
-
-// Check system compatibility
-int check_system_compatibility()
-{
-    // Cross-platform compatibility check
-    const char *platform =
-#ifdef __linux__
-        "Linux";
-#elif __APPLE__
-        "macOS";
-#elif _WIN32
-        "Windows";
-#else
-        "Unix-like";
-#endif
-
-    log_message("INFO", "Running on %s platform", platform);
-
-#ifdef __linux__
-    if (!safe_executable_exists("/usr/bin/usbip") && !safe_executable_exists("/usr/sbin/usbip") &&
-        !safe_executable_exists("/bin/usbip") && !safe_executable_exists("/sbin/usbip"))
-    {
-        log_message("WARN", "usbip command not found. Install: sudo apt install "
-                            "linux-tools-generic");
-    }
-
-    // Check if usbip-host module is available
-    if (!safe_file_exists("/sys/bus/usb/drivers/usbip-host"))
-    {
-        log_message("WARN", "usbip-host driver not found. Run: sudo modprobe usbip-host");
-    }
-
-    // Check root privileges on Linux
-    if (geteuid() != 0)
-    {
-        log_message("WARN", "Not running as root. Some USB operations may fail");
-    }
-
-#elif __APPLE__
-    // macOS: Check for third-party usbip implementations
-    if (!safe_executable_exists("/usr/local/bin/usbip") && !safe_executable_exists("/opt/homebrew/bin/usbip") &&
-        !safe_executable_exists("/usr/bin/usbip"))
-    {
-        log_message("WARN", "usbip command not found. Limited functionality available");
-        log_message("INFO", "Third-party usbip tools may be available for macOS");
-    }
-
-    if (geteuid() != 0)
-    {
-        log_message("INFO", "Running as regular user on macOS (development mode)");
-    }
-
-#elif _WIN32
-    log_message("INFO", "Windows support requires usbipd-win or usbip-win");
-
-    // Check for usbipd-win installation
-    char output[512];
-    if (exec_command("usbipd --version", output, sizeof(output)) == 0)
-    {
-        log_message("INFO", "Found usbipd-win: %s", output);
-    }
-    else if (exec_command("usbip version", output, sizeof(output)) == 0)
-    {
-        log_message("INFO", "Found usbip: %s", output);
-    }
-    else
-    {
-        log_message("WARN", "usbipd-win not found. Install from: "
-                            "https://github.com/dorssel/usbipd-win");
-        log_message("INFO", "Alternative: Install usbip-win or use WSL with Linux usbip tools");
-    }
-
-    // Check if running as Administrator (optional for web interface)
-    // Note: Checking admin privileges on Windows requires additional APIs
-    log_message("INFO", "For full functionality, run as Administrator");
-
-#else
-    log_message("WARN", "Untested platform. Web interface functionality available");
-#endif
-
-    return 1; // Always succeed - allow running in limited mode
-}
-
-// Get local IP address for display
-char *get_local_ip()
-{
+// Get local IP address
+char *get_local_ip(void) {
     static char ip_str[INET_ADDRSTRLEN] = "localhost";
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0)
+    
+#ifdef PLATFORM_WINDOWS
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         return ip_str;
+    }
+#endif
+    
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+#ifdef PLATFORM_WINDOWS
+        WSACleanup();
+#endif
+        return ip_str;
+    }
 
     struct sockaddr_in dest;
     memset(&dest, 0, sizeof(dest));
     dest.sin_family = AF_INET;
-    dest.sin_addr.s_addr = inet_addr("223.5.5.5"); // Use Aliyun DNS for route discovery
+    dest.sin_addr.s_addr = inet_addr("223.5.5.5");
     dest.sin_port = htons(80);
 
-    if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) == 0)
-    {
+    if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) == 0) {
         struct sockaddr_in local;
         socklen_t local_len = sizeof(local);
-        if (getsockname(sock, (struct sockaddr *)&local, &local_len) == 0)
-        {
+        if (getsockname(sock, (struct sockaddr *)&local, &local_len) == 0) {
             inet_ntop(AF_INET, &local.sin_addr, ip_str, INET_ADDRSTRLEN);
         }
     }
     close(sock);
+    
+#ifdef PLATFORM_WINDOWS
+    WSACleanup();
+#endif
+    
     return ip_str;
 }
 
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
-
-// Get home directory path - with enhanced security validation
-const char *get_home_dir()
-{
-#ifdef PLATFORM_WINDOWS
-    const char *home = getenv("USERPROFILE");
-    if (home && validate_env_path(home)) {
-        return home;
-    }
-    
-    home = getenv("HOMEDRIVE");
-    if (home && validate_env_path(home))
-    {
-        const char *homepath = getenv("HOMEPATH");
-        if (homepath && validate_env_path(homepath))
-        {
-            static char win_home[512];
-            int ret = snprintf(win_home, sizeof(win_home), "%s%s", home, homepath);
-            if (ret > 0 && (size_t)ret < sizeof(win_home)) {
-                return win_home;
-            }
-        }
-    }
-    return "C:\\temp";
-#else
-    const char *home = getenv("HOME");
-    if (home && validate_env_path(home) && strnlen(home, 4096) < 4096) {
-        // Additional validation for environment variable
-        static char safe_home[1024];
-        strncpy(safe_home, home, sizeof(safe_home) - 1);
-        safe_home[sizeof(safe_home) - 1] = '\0';
-        return safe_home;
-    }
-    return "/tmp";
-#endif
-}
-
 // Initialize default configuration
-void init_config()
-{
+void init_config(void) {
 #ifdef PLATFORM_WINDOWS
-    snprintf(g_config.config_path, sizeof(g_config.config_path), "%s\\AppData\\Local\\usbctl\\config", get_home_dir());
+    char appdata[MAX_PATH];
+    if (GetEnvironmentVariableA("LOCALAPPDATA", appdata, sizeof(appdata)) > 0) {
+        snprintf(g_config.config_path, sizeof(g_config.config_path), 
+                "%s\\usbctl\\config", appdata);
+    } else {
+        snprintf(g_config.config_path, sizeof(g_config.config_path), 
+                "C:\\ProgramData\\usbctl\\config");
+    }
+    snprintf(g_config.log_file, sizeof(g_config.log_file), 
+            "C:\\ProgramData\\usbctl\\usbctl.log");
 #else
-    snprintf(g_config.config_path, sizeof(g_config.config_path), "/etc/usbctl/config");
+    int ret = snprintf(g_config.config_path, sizeof(g_config.config_path), 
+                      "/etc/usbctl/config");
+    if (ret < 0 || ret >= (int)sizeof(g_config.config_path)) {
+        log_message("WARN", "Config path truncated");
+    }
 #endif
 }
 
 // Create directory recursively
-int mkdirs(const char *path)
-{
+int mkdirs(const char *path) {
+    if (!path) return -1;
+    
     char tmp[512];
-    char *p = NULL;
-    size_t len;
-
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    len = strlen(tmp);
-
+    int ret = snprintf(tmp, sizeof(tmp), "%s", path);
+    if (ret < 0 || ret >= (int)sizeof(tmp)) return -1;
+    
+    size_t len = strlen(tmp);
 #ifdef PLATFORM_WINDOWS
-    // Handle Windows path separators
-    if (tmp[len - 1] == '\\' || tmp[len - 1] == '/')
-    {
-        tmp[len - 1] = 0;
+    if (tmp[len - 1] == '\\' || tmp[len - 1] == '/') {
+        tmp[len - 1] = '\0';
     }
-
-    for (p = tmp + 1; *p; p++)
-    {
-        if (*p == '\\' || *p == '/')
-        {
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '\\' || *p == '/') {
             char sep = *p;
-            *p = 0;
-            mkdir(tmp, 0755); // Windows _mkdir macro doesn't use mode parameter
+            *p = '\0';
+            mkdir(tmp, 0755);
             *p = sep;
         }
     }
-    return mkdir(tmp, 0755);
 #else
-    // Unix/Linux path separators
-    if (tmp[len - 1] == '/')
-    {
-        tmp[len - 1] = 0;
+    if (tmp[len - 1] == '/') {
+        tmp[len - 1] = '\0';
     }
-
-    for (p = tmp + 1; *p; p++)
-    {
-        if (*p == '/')
-        {
-            *p = 0;
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
             mkdir(tmp, 0755);
             *p = '/';
         }
     }
-    return mkdir(tmp, 0755);
 #endif
+    return mkdir(tmp, 0755);
 }
 
-// Load configuration from file
-int load_config()
-{
+// Load configuration
+int load_config(void) {
     FILE *fp = fopen(g_config.config_path, "r");
-    if (!fp)
-        return 0;
+    if (!fp) return 0;
 
     char line[256];
-    g_config.bound_devices_count = 0; // Reset bound devices count
+    g_config.bound_devices_count = 0;
 
-    while (fgets(line, sizeof(line), fp))
-    {
-        // Remove trailing newline
+    while (fgets(line, sizeof(line), fp)) {
         line[strcspn(line, "\n")] = '\0';
 
-        if (strncmp(line, "port=", 5) == 0)
-        {
+        if (strncmp(line, "port=", 5) == 0) {
             g_config.port = atoi(line + 5);
-        }
-        else if (strncmp(line, "bind=", 5) == 0)
-        {
-            sscanf(line + 5, "%63s", g_config.bind_address);
-        }
-        else if (strncmp(line, "poll_interval=", 14) == 0)
-        {
+        } else if (strncmp(line, "bind=", 5) == 0) {
+            size_t len = safe_strnlen(line + 5, sizeof(g_config.bind_address) - 1);
+            memcpy(g_config.bind_address, line + 5, len);
+            g_config.bind_address[len] = '\0';
+        } else if (strncmp(line, "poll_interval=", 14) == 0) {
             g_config.poll_interval = atoi(line + 14);
-        }
-        else if (strncmp(line, "verbose_logging=", 16) == 0)
-        {
+        } else if (strncmp(line, "verbose_logging=", 16) == 0) {
             g_config.verbose_logging = atoi(line + 16);
-        }
-        else if (strncmp(line, "log_file=", 9) == 0)
-        {
-            sscanf(line + 9, "%255s", g_config.log_file);
-        }
-        else if (strncmp(line, "bound_device=", 13) == 0 && g_config.bound_devices_count < MAX_DEVICES)
-        {
-            // Load bound device busid
-            sscanf(line + 13, "%15s", g_config.bound_devices[g_config.bound_devices_count]);
+        } else if (strncmp(line, "log_file=", 9) == 0) {
+            size_t len = safe_strnlen(line + 9, sizeof(g_config.log_file) - 1);
+            memcpy(g_config.log_file, line + 9, len);
+            g_config.log_file[len] = '\0';
+        } else if (strncmp(line, "bound_device=", 13) == 0 && 
+                   g_config.bound_devices_count < MAX_DEVICES) {
+            size_t len = safe_strnlen(line + 13, 15);
+            memcpy(g_config.bound_devices[g_config.bound_devices_count], line + 13, len);
+            g_config.bound_devices[g_config.bound_devices_count][len] = '\0';
             g_config.bound_devices_count++;
-            log_message("DEBUG", "Loaded bound device from config: %s", line + 13);
         }
     }
     fclose(fp);
-
-    log_message("INFO", "Configuration loaded: %d bound devices found", g_config.bound_devices_count);
     return 1;
 }
 
-// Save configuration to file
-int save_config()
-{
-    // Create config directory if it doesn't exist
+// Save configuration
+int save_config(void) {
     char dir_path[512];
-    strncpy(dir_path, g_config.config_path, sizeof(dir_path));
+    int ret = snprintf(dir_path, sizeof(dir_path), "%s", g_config.config_path);
+    if (ret < 0 || ret >= (int)sizeof(dir_path)) return 0;
+    
     char *last_slash = strrchr(dir_path, '/');
-    if (last_slash)
-    {
+    if (last_slash) {
         *last_slash = '\0';
         mkdirs(dir_path);
     }
 
     FILE *fp = fopen(g_config.config_path, "w");
-    if (!fp)
-        return 0;
+    if (!fp) return 0;
 
     fprintf(fp, "port=%d\n", g_config.port);
     fprintf(fp, "bind=%s\n", g_config.bind_address);
     fprintf(fp, "poll_interval=%d\n", g_config.poll_interval);
 
-    // Save currently bound devices
     update_bound_devices_config();
-    for (int i = 0; i < g_config.bound_devices_count; i++)
-    {
-        if (strlen(g_config.bound_devices[i]) > 0)
-        {
+    for (int i = 0; i < g_config.bound_devices_count; i++) {
+        if (strlen(g_config.bound_devices[i]) > 0) {
             fprintf(fp, "bound_device=%s\n", g_config.bound_devices[i]);
         }
     }
 
     fclose(fp);
-    log_message("INFO", "Configuration saved with %d bound devices", g_config.bound_devices_count);
     return 1;
 }
 
@@ -1154,450 +724,276 @@ int save_config()
 // USB/IP BACKEND FUNCTIONS
 // ============================================================================
 
-// Update bound devices configuration based on current device states
-void update_bound_devices_config()
-{
+// Update bound devices configuration
+void update_bound_devices_config(void) {
     g_config.bound_devices_count = 0;
-    for (int i = 0; i < g_device_count; i++)
-    {
-        if (g_devices[i].bound && g_config.bound_devices_count < MAX_DEVICES)
-        {
-            // Use snprintf for safer string copying, limit to busid size
-            int len = snprintf(g_config.bound_devices[g_config.bound_devices_count], sizeof(g_config.bound_devices[0]),
-                               "%.*s", (int)sizeof(g_devices[i].busid) - 1, g_devices[i].busid);
-            if (len > 0 && len < (int)sizeof(g_config.bound_devices[0]))
-            {
-                g_config.bound_devices_count++;
+    for (int i = 0; i < g_device_count; i++) {
+        if (g_devices[i].bound && g_config.bound_devices_count < MAX_DEVICES) {
+            size_t len = safe_strnlen(g_devices[i].busid, 15);
+            memcpy(g_config.bound_devices[g_config.bound_devices_count], 
+                   g_devices[i].busid, len);
+            g_config.bound_devices[g_config.bound_devices_count][len] = '\0';
+            g_config.bound_devices_count++;
+        }
+    }
+}
+
+// Restore bound devices
+void restore_bound_devices(void) {
+    log_message("INFO", "Restoring bound devices");
+
+    for (int i = 0; i < g_config.bound_devices_count; i++) {
+        if (strlen(g_config.bound_devices[i]) > 0) {
+            if (bind_device(g_config.bound_devices[i])) {
+                log_message("INFO", "Restored: %s", g_config.bound_devices[i]);
             }
         }
     }
 }
 
-// Restore bound devices from configuration (for system restart recovery)
-void restore_bound_devices()
-{
-    log_message("INFO", "Restoring bound devices from configuration...");
-
-    for (int i = 0; i < g_config.bound_devices_count; i++)
-    {
-        if (strlen(g_config.bound_devices[i]) > 0)
-        {
-            log_message("INFO", "Restoring bind for device: %s", g_config.bound_devices[i]);
-            if (bind_device(g_config.bound_devices[i]))
-            {
-                log_message("INFO", "Successfully restored bind for device: %s", g_config.bound_devices[i]);
-            }
-            else
-            {
-                log_message("WARNING",
-                            "Failed to restore bind for device: %s (device may not be "
-                            "available)",
-                            g_config.bound_devices[i]);
-            }
-        }
-    }
-
-    log_message("INFO", "Bound device restoration completed");
-}
-
-// Check if a device should be bound based on configuration
-int is_device_configured_as_bound(const char *busid)
-{
-    for (int i = 0; i < g_config.bound_devices_count; i++)
-    {
-        if (strcmp(g_config.bound_devices[i], busid) == 0)
-        {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-// Execute command and capture output - with enhanced security
-int exec_command(const char *cmd, char *output, size_t output_size)
-{
-    return secure_exec_command(cmd, output, output_size);
-}
-
-// Check device binding status - safer version without TOCTOU race condition
-int is_device_bound(const char *busid)
-{
-    if (!busid) {
-        return 0; // Invalid busid
-    }
-    
-    // Safe length check to prevent over-read
-    size_t busid_len = strnlen(busid, 64);  // Reasonable max busid length
-    if (busid_len == 0 || busid_len >= 64) {
-        log_message("WARN", "Invalid busid length");
-        return 0;
-    }
-    
-    // Validate busid format (should be like "1-1.2")
-    for (size_t i = 0; i < busid_len; i++) {
-        char c = busid[i];
-        if (!(c >= '0' && c <= '9') && c != '-' && c != '.') {
-            log_message("WARN", "Invalid busid format: %.*s", (int)busid_len, busid);
-            return 0;
-        }
-    }
-    
-    char path[256];
-    int ret = snprintf(path, sizeof(path), "/sys/bus/usb/drivers/usbip-host/%.*s", (int)busid_len, busid);
-    if (ret >= (int)sizeof(path) || ret < 0) {
-        log_message("ERROR", "Path construction failed for busid");
-        return 0;
-    }
-    
-    // Use stat() instead of access() to avoid TOCTOU race condition
-    struct stat st;
-    return (stat(path, &st) == 0);
-}
-// Parse output of 'lsusb' and populate g_lsusb_map
-static void parse_lsusb(const char *output)
-{
+#ifndef PLATFORM_WINDOWS
+// Parse lsusb output (Linux only)
+static void parse_lsusb(const char *output) {
     g_lsusb_count = 0;
-    if (!output)
-        return;
+    if (!output) return;
 
-    char *buf = strdup(output);
-    if (!buf)
-        return;
+    char buf[8192];
+    size_t len = safe_strnlen(output, sizeof(buf) - 1);
+    memcpy(buf, output, len);
+    buf[len] = '\0';
 
     char *line = strtok(buf, "\n");
-    while (line && g_lsusb_count < MAX_LSUSB_ENTRIES)
-    {
+    while (line && g_lsusb_count < MAX_LSUSB_ENTRIES) {
         char *id_pos = strstr(line, "ID ");
-        if (id_pos)
-        {
+        if (id_pos) {
             id_pos += 3;
             char *colon = strchr(id_pos, ':');
-            if (colon && (colon - id_pos == 4))
-            {
+            if (colon && (colon - id_pos == 4)) {
                 char vid[5] = {0}, pid[5] = {0};
-
-                strncpy(vid, id_pos, 4);
-                strncpy(pid, colon + 1, 4);
+                memcpy(vid, id_pos, 4);
+                memcpy(pid, colon + 1, 4);
 
                 char *desc_start = colon + 5;
-                while (*desc_start == ' ')
-                    desc_start++;
+                while (*desc_start == ' ') desc_start++;
 
-                if (*desc_start)
-                {
-                    snprintf(g_lsusb_map[g_lsusb_count].id, sizeof(g_lsusb_map[0].id), "%s:%s", vid, pid);
-                    strncpy(g_lsusb_map[g_lsusb_count].desc, desc_start, sizeof(g_lsusb_map[0].desc) - 1);
-                    g_lsusb_map[g_lsusb_count].desc[sizeof(g_lsusb_map[0].desc) - 1] = '\0';
+                if (*desc_start) {
+                    snprintf(g_lsusb_map[g_lsusb_count].id, 
+                            sizeof(g_lsusb_map[0].id), "%s:%s", vid, pid);
+                    size_t desc_len = safe_strnlen(desc_start, 
+                                                   sizeof(g_lsusb_map[0].desc) - 1);
+                    memcpy(g_lsusb_map[g_lsusb_count].desc, desc_start, desc_len);
+                    g_lsusb_map[g_lsusb_count].desc[desc_len] = '\0';
                     g_lsusb_count++;
                 }
             }
         }
         line = strtok(NULL, "\n");
     }
-    free(buf);
 }
-// List USB/IP devices with enhanced compatibility and lsusb fallback
-int list_usbip_devices()
-{
-    char output[4096];
-    char lsusb_output[8192]; // lsusb output can be larger
+#endif
 
-    // Step 1: Try to get lsusb data first (for fallback)
+// List USB devices
+int list_usbip_devices(void) {
+    char output[4096];
+
+#ifndef PLATFORM_WINDOWS
+    // Step 1: Try to get lsusb data (Linux only)
+    char lsusb_output[8192];
     g_lsusb_count = 0;
-    if (exec_command("lsusb", lsusb_output, sizeof(lsusb_output)) == 0)
-    {
+    if (secure_exec_command("lsusb", lsusb_output, sizeof(lsusb_output)) == 0) {
         parse_lsusb(lsusb_output);
     }
-    else
-    {
-        log_message("WARN", "Failed to run 'lsusb', device descriptions may be incomplete");
-    }
+#endif
 
     // Step 2: Try usbip commands
 #ifdef PLATFORM_WINDOWS
-    const char *usbip_commands[] = {"usbipd wsl list",   // usbipd-win for WSL
-                                    "usbip list -l",     // Standard command (if available)
-                                    "wsl usbip list -l", // Via WSL
-                                    "C:\\Program Files\\usbipd-win\\usbipd.exe wsl list", // Full path
-                                                                                          // usbipd-win
-                                    NULL};
+    const char *usbip_commands[] = {
+        "usbipd wsl list",
+        "usbipd list",
+        "usbip list -l",
+        NULL
+    };
 #else
-    const char *usbip_commands[] = {"usbip list -l",           // Standard command
-                                    "/usr/bin/usbip list -l",  // Explicit path
-                                    "/usr/sbin/usbip list -l", // Alternative path
-                                    "usbip list --local",      // Alternative syntax
-                                    NULL};
+    const char *usbip_commands[] = {
+        "usbip list -l",
+        "/usr/bin/usbip list -l",
+        "/usr/sbin/usbip list -l",
+        NULL
+    };
 #endif
 
     int cmd_success = 0;
-    for (int i = 0; usbip_commands[i] != NULL; i++)
-    {
-        if (exec_command(usbip_commands[i], output, sizeof(output)) == 0)
-        {
+    for (int i = 0; usbip_commands[i] != NULL; i++) {
+        if (secure_exec_command(usbip_commands[i], output, sizeof(output)) == 0) {
             cmd_success = 1;
-            // Only log command success during startup or if verbose logging
-            // enabled
-            if (!g_server_started || g_config.verbose_logging)
-            {
-                log_message("DEBUG", "Successfully executed: %s", usbip_commands[i]);
-            }
             break;
         }
     }
 
-    if (!cmd_success)
-    {
-        if (!g_usbip_error_shown)
-        {
-            log_message("ERROR", "Failed to execute usbip command. Ensure "
-                                 "usbip tools are installed");
+    if (!cmd_success) {
+        if (!g_usbip_error_shown) {
+            log_message("ERROR", "Failed to execute usbip");
             g_usbip_error_shown = 1;
         }
         return 0;
     }
 
-    // Step 3: Parse usbip output
     g_device_count = 0;
-    char *buf = strdup(output);
-    if (!buf)
-        return 0;
+    char buf[4096];
+    size_t len = safe_strnlen(output, sizeof(buf) - 1);
+    memcpy(buf, output, len);
+    buf[len] = '\0';
 
     char *line = strtok(buf, "\n");
     usb_device_t *current = NULL;
 
-    while (line && g_device_count < MAX_DEVICES)
-    {
-        char *original_line = line; // ← 保留原始行用于缩进判断
-
-        // Trim leading whitespace for content
+    while (line && g_device_count < MAX_DEVICES) {
+        char *original_line = line;
         char *trimmed = line;
-        while (*trimmed == ' ' || *trimmed == '\t')
-            trimmed++;
+        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
 
-        if (trimmed[0] == '\0')
-        {
+        if (trimmed[0] == '\0') {
             line = strtok(NULL, "\n");
             continue;
         }
 
-        // New device line
-        if (strncmp(trimmed, "- busid", 7) == 0)
-        {
+        if (strncmp(trimmed, "- busid", 7) == 0 || strncmp(trimmed, "BUSID", 5) == 0) {
             current = &g_devices[g_device_count++];
             memset(current, 0, sizeof(usb_device_t));
 
-            // Extract busid
             char *busid_start = strstr(trimmed, "busid ");
-            if (busid_start)
-                busid_start += 6;
-            else
+            if (!busid_start) busid_start = strstr(trimmed, "BUSID");
+            if (busid_start) {
+                busid_start += (strncmp(busid_start, "BUSID", 5) == 0) ? 5 : 6;
+            } else {
                 busid_start = trimmed + 8;
+            }
 
-            while (busid_start && *busid_start == ' ')
-                busid_start++;
-            if (busid_start)
-            {
+            while (busid_start && *busid_start == ' ') busid_start++;
+            
+            if (busid_start) {
                 char *end = strpbrk(busid_start, " \t(");
-                if (end)
-                {
-                    int len = (end - busid_start < 15) ? (end - busid_start) : 15;
-                    memcpy(current->busid, busid_start, len);
-                    current->busid[len] = '\0';
+                size_t busid_len;
+                if (end) {
+                    busid_len = (end - busid_start < 15) ? (end - busid_start) : 15;
+                } else {
+                    busid_len = safe_strnlen(busid_start, 15);
                 }
-                else
-                {
-                    strncpy(current->busid, busid_start, 15);
-                    current->busid[15] = '\0';
-                }
+                memcpy(current->busid, busid_start, busid_len);
+                current->busid[busid_len] = '\0';
                 current->bound = is_device_bound(current->busid);
-                if (!g_server_started || g_config.verbose_logging)
-                {
-                    log_message("DEBUG", "Found device: %s (bound: %d)", current->busid, current->bound);
-                }
             }
-        }
-        // Device description line: must be indented in ORIGINAL line
-        else if (current && (original_line[0] == ' ' || original_line[0] == '\t'))
-        {
-            if (strlen(current->info) > 0)
-            {
-                strncat(current->info, " ", sizeof(current->info) - strlen(current->info) - 1);
+        } else if (current && (original_line[0] == ' ' || original_line[0] == '\t')) {
+            size_t current_len = strlen(current->info);
+            size_t avail = sizeof(current->info) - current_len - 1;
+            if (current_len > 0 && avail > 0) {
+                current->info[current_len] = ' ';
+                current_len++;
+                avail--;
             }
-            strncat(current->info, trimmed, sizeof(current->info) - strlen(current->info) - 1);
+            if (avail > 0) {
+                size_t copy_len = safe_strnlen(trimmed, avail);
+                memcpy(current->info + current_len, trimmed, copy_len);
+                current->info[current_len + copy_len] = '\0';
+            }
         }
 
         line = strtok(NULL, "\n");
     }
 
-    // Step 4: Fallback to lsusb for "unknown" devices
-    for (int i = 0; i < g_device_count; i++)
-    {
-        if (strstr(g_devices[i].info, "unknown vendor"))
-        {
-            // Extract VID:PID from original usbip line (we need to re-parse
-            // output for this) Simpler: scan original output for this busid's
-            // line
-            char *search = buf;
-            char *busid_line = NULL;
-            while ((search = strstr(search, g_devices[i].busid)) != NULL)
-            {
-                // Check if this is a busid line
-                if (search > buf && *(search - 1) == ' ')
-                {
-                    // Find start of line
-                    char *start = search;
-                    while (start > buf && *(start - 1) != '\n')
-                        start--;
-                    if (strncmp(start, " - busid", 8) == 0)
-                    {
-                        busid_line = start;
+#ifndef PLATFORM_WINDOWS
+    // Enhance with lsusb data on Linux
+    for (int i = 0; i < g_device_count; i++) {
+        if (strstr(g_devices[i].info, "unknown vendor")) {
+            char *paren = strchr(g_devices[i].info, '(');
+            if (paren) {
+                char vidpid[10] = {0};
+                size_t vidpid_len = safe_strnlen(paren + 1, 9);
+                memcpy(vidpid, paren + 1, vidpid_len);
+                vidpid[vidpid_len] = '\0';
+                char *close_paren = strchr(vidpid, ')');
+                if (close_paren) *close_paren = '\0';
+
+                for (int j = 0; j < g_lsusb_count; j++) {
+                    if (strcmp(g_lsusb_map[j].id, vidpid) == 0) {
+                        size_t desc_len = safe_strnlen(g_lsusb_map[j].desc, 
+                                                       sizeof(g_devices[i].info) - 1);
+                        memcpy(g_devices[i].info, g_lsusb_map[j].desc, desc_len);
+                        g_devices[i].info[desc_len] = '\0';
                         break;
-                    }
-                }
-                search++;
-            }
-
-            if (busid_line)
-            {
-                char *paren = strchr(busid_line, '(');
-                if (paren)
-                {
-                    char vidpid[10] = {0};
-                    sscanf(paren + 1, "%9[^)]", vidpid); // extract "303a:1001"
-
-                    // Look up in lsusb map
-                    for (int j = 0; j < g_lsusb_count; j++)
-                    {
-                        if (strcmp(g_lsusb_map[j].id, vidpid) == 0)
-                        {
-                            strncpy(g_devices[i].info, g_lsusb_map[j].desc, sizeof(g_devices[i].info) - 1);
-                            g_devices[i].info[sizeof(g_devices[i].info) - 1] = '\0';
-                            if (!g_server_started || g_config.verbose_logging)
-                            {
-                                log_message("DEBUG", "Enhanced device %s info: %s", g_devices[i].busid,
-                                            g_devices[i].info);
-                            }
-                            break;
-                        }
                     }
                 }
             }
         }
     }
+#endif
 
-    free(buf);
     return g_device_count;
 }
 
 // Bind USB device
-int bind_device(const char *busid)
-{
-    if (!busid || strlen(busid) == 0)
-    {
-        log_message("ERROR", "Invalid busid: %s", busid ? busid : "(null)");
+int bind_device(const char *busid) {
+    if (!validate_busid(busid)) {
+        log_message("ERROR", "Invalid busid");
         return 0;
     }
 
     char cmd[256];
     char output[1024] = {0};
+    
 #ifdef PLATFORM_WINDOWS
-    // Windows: Try different usbipd-win commands
-    snprintf(cmd, sizeof(cmd), "usbipd wsl attach --busid %s", busid);
+    int ret = snprintf(cmd, sizeof(cmd), "usbipd wsl attach --busid %s", busid);
 #else
-    // Unix/Linux: Standard usbip command
-    snprintf(cmd, sizeof(cmd), "usbip bind -b %s", busid);
+    int ret = snprintf(cmd, sizeof(cmd), "usbip bind -b %s", busid);
 #endif
-
-    log_message("INFO", "Attempting to bind device: %s", busid);
-
-    int result = (exec_command(cmd, output, sizeof(output)) == 0);
-    if (result)
-    {
-        log_message("INFO", "Successfully bound device: %s", busid);
+    
+    if (ret < 0 || ret >= (int)sizeof(cmd)) {
+        log_message("ERROR", "Command too long");
+        return 0;
     }
-    else
-    {
-        log_message("ERROR", "Failed to bind device: %s", busid);
-#ifdef PLATFORM_WINDOWS
-        log_message("INFO", "Ensure usbipd-win is installed and device is shared");
-#endif
+
+    log_message("INFO", "Binding device: %s", busid);
+    int result = (secure_exec_command(cmd, output, sizeof(output)) == 0);
+    
+    if (result) {
+        log_message("INFO", "Successfully bound: %s", busid);
+    } else {
+        log_message("ERROR", "Failed to bind: %s", busid);
     }
 
     return result;
 }
 
-// 命令行专用解绑函数
-int unbind_device(const char *busid)
-{
-    if (!busid || strlen(busid) == 0)
-    {
-        log_message("ERROR", "Invalid busid: %s", busid ? busid : "(null)");
+// Unbind USB device
+int unbind_device(const char *busid) {
+    if (!validate_busid(busid)) {
+        log_message("ERROR", "Invalid busid");
         return 0;
     }
 
     char cmd[256];
+    char output[1024] = {0};
+    
 #ifdef PLATFORM_WINDOWS
-    // Windows: Try different usbipd-win commands
-    snprintf(cmd, sizeof(cmd), "usbipd wsl detach --busid %s", busid);
+    int ret = snprintf(cmd, sizeof(cmd), "usbipd wsl detach --busid %s", busid);
 #else
-    // Unix/Linux: Standard usbip command
-    snprintf(cmd, sizeof(cmd), "usbip unbind -b %s", busid);
+    int ret = snprintf(cmd, sizeof(cmd), "usbip unbind -b %s", busid);
 #endif
-
-    log_message("INFO", "Attempting to unbind device: %s", busid);
-    char output[1024];
-    int result = exec_command(cmd, output, sizeof(output)) == 0;
-
-    if (result)
-    {
-        log_message("INFO", "Successfully unbound device: %s", busid);
-    }
-    else
-    {
-        log_message("ERROR", "Failed to unbind device: %s", busid);
-#ifdef PLATFORM_WINDOWS
-        log_message("INFO", "Ensure usbipd-win is installed and device is attached");
-#endif
-    }
-
-    log_message("DEBUG", "Command output: %s", output);
-    return result;
-}
-
-// web专用解绑函数
-int unbind_device_web(int client_socket, const char *busid)
-{
-    if (!busid || strlen(busid) == 0)
-    {
-        log_message("ERROR", "Invalid busid: %s", busid ? busid : "(null)");
-        send_http_response(client_socket, 400, "Bad Request", "application/json",
-                           "{\"status\":\"failed\",\"error\":\"Invalid busid\"}");
+    
+    if (ret < 0 || ret >= (int)sizeof(cmd)) {
+        log_message("ERROR", "Command too long");
         return 0;
     }
 
-    char cmd[256];
-#ifdef PLATFORM_WINDOWS
-    // Windows: Try different usbipd-win commands
-    snprintf(cmd, sizeof(cmd), "usbipd wsl detach --busid %s", busid);
-#else
-    // Unix/Linux: Standard usbip command
-    snprintf(cmd, sizeof(cmd), "usbip unbind -b %s", busid);
-#endif
+    log_message("INFO", "Unbinding device: %s", busid);
+    int result = secure_exec_command(cmd, output, sizeof(output)) == 0;
 
-    log_message("INFO", "Attempting to unbind device: %s", busid);
-    char output[1024];
-    int result = exec_command(cmd, output, sizeof(output)) == 0;
+    if (result) {
+        log_message("INFO", "Successfully unbound: %s", busid);
+    } else {
+        log_message("ERROR", "Failed to unbind: %s", busid);
+    }
 
-    if (result)
-    {
-        log_message("INFO", "Successfully unbound device: %s", busid);
-        send_http_response(client_socket, 200, "OK", "application/json", output);
-    }
-    else
-    {
-        log_message("ERROR", "Failed to unbind device: %s", busid);
-        send_http_response(client_socket, 500, "Internal Server Error", "application/json", output);
-    }
     return result;
 }
 
@@ -1605,151 +1001,103 @@ int unbind_device_web(int client_socket, const char *busid)
 // HTTP SERVER FUNCTIONS
 // ============================================================================
 
-// Generate full HTML page - with safe formatting
-void generate_html_page(char *buffer, size_t buffer_size)
-{
-    if (!buffer || buffer_size == 0) {
-        return;
-    }
+// Generate HTML page
+void generate_html_page(char *buffer, size_t buffer_size) {
+    if (!buffer || buffer_size == 0) return;
     
-    // Use safer string concatenation instead of complex format string
-    size_t written = 0;
-    const char *html_start = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>USB/IP Control</title>";
-    written += snprintf(buffer + written, buffer_size - written, "%s", html_start);
-    
-    if (written < buffer_size - 1) {
-        written += snprintf(buffer + written, buffer_size - written, "<style>%s</style>", EMBEDDED_CSS);
+    int ret = snprintf(buffer, buffer_size, EMBEDDED_HTML, 
+                      EMBEDDED_CSS, LOGO_SVG, EMBEDDED_JS);
+    if (ret < 0 || ret >= (int)buffer_size) {
+        log_message("WARN", "HTML page truncated");
     }
-    if (written < buffer_size - 1) {
-        written += snprintf(buffer + written, buffer_size - written, "</head><body>%s", LOGO_SVG);
-    }
-    if (written < buffer_size - 1) {
-        written += snprintf(buffer + written, buffer_size - written, "<script>%s</script></body></html>", EMBEDDED_JS);
-    }
-    
-    buffer[buffer_size - 1] = '\0'; // Ensure null termination
 }
 
-// Send HTTP response - with enhanced security
-void send_http_response(int client_socket, int status_code, const char *status_text, const char *content_type,
-                        const char *body)
-{
-    if (client_socket < 0) {
-        log_message("ERROR", "Invalid client socket");
-        return;
-    }
+// Send HTTP response
+void send_http_response(int client_socket, int status_code, const char *status_text,
+                       const char *content_type, const char *body) {
+    if (client_socket < 0) return;
     
-    // Validate and sanitize parameters
     const char *safe_status_text = status_text ? status_text : "Unknown";
     const char *safe_content_type = content_type ? content_type : "text/plain";
     
-    char header[1024]; // Increased buffer size for safety
-    int body_len = body ? strnlen(body, 1024*1024) : 0; // Limit body length check
+    char header[1024];
+    int body_len = body ? safe_strnlen(body, 1024*1024) : 0;
 
     int header_len = snprintf(header, sizeof(header),
-             "HTTP/1.1 %d %s\r\n"
-             "Content-Type: %s\r\n"
-             "Content-Length: %d\r\n"
-             "Connection: close\r\n"
-             "X-Content-Type-Options: nosniff\r\n"
-             "X-Frame-Options: DENY\r\n"
-             "\r\n",
-             status_code, safe_status_text, safe_content_type, body_len);
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "X-Frame-Options: DENY\r\n"
+        "\r\n",
+        status_code, safe_status_text, safe_content_type, body_len);
 
-    if (header_len >= (int)sizeof(header)) {
-        log_message("ERROR", "HTTP header too large");
-        return;
-    }
+    if (header_len >= (int)sizeof(header)) return;
 
-    ssize_t sent = send(client_socket, header, header_len, 0);
-    if (sent < 0) {
-        log_message("ERROR", "Failed to send HTTP header");
-        return;
-    }
-    
+    send(client_socket, header, header_len, 0);
     if (body && body_len > 0) {
-        sent = send(client_socket, body, body_len, 0);
-        if (sent < 0) {
-            log_message("ERROR", "Failed to send HTTP body");
-        }
+        send(client_socket, body, body_len, 0);
     }
 }
 
-// Generate JSON for devices
-void generate_devices_json(char *buffer, size_t buffer_size)
-{
-    if (buffer_size == 0)
-        return;
-    buffer[0] = '\0';
-    strncat(buffer, "[", buffer_size - 1);
-    for (int i = 0; i < g_device_count; i++)
-    {
-        // Sanitize / truncate info to avoid overly large SSE frames
-        const char *info_src = g_devices[i].info;
+// Generate devices JSON
+void generate_devices_json(char *buffer, size_t buffer_size) {
+    if (buffer_size == 0) return;
+    
+    size_t pos = 0;
+    buffer[pos++] = '[';
+    
+    for (int i = 0; i < g_device_count && pos < buffer_size - 1; i++) {
+        // Sanitize info field
         char info_sanitized[256];
         size_t k = 0;
-        for (size_t j = 0; info_src[j] && k < sizeof(info_sanitized) - 1; j++)
-        {
-            unsigned char c = (unsigned char)info_src[j];
-            // Escape quotes and backslashes minimally
-            if (c == '"' || c == '\\')
-            {
-                if (k + 2 >= sizeof(info_sanitized) - 1)
-                    break;
+        for (size_t j = 0; g_devices[i].info[j] && k < sizeof(info_sanitized) - 1; j++) {
+            unsigned char c = (unsigned char)g_devices[i].info[j];
+            if (c == '"' || c == '\\') {
+                if (k + 2 >= sizeof(info_sanitized) - 1) break;
                 info_sanitized[k++] = '\\';
                 info_sanitized[k++] = c;
-            }
-            else if ((c >= 32 && c < 127))
-            {
+            } else if (c >= 32 && c < 127) {
                 info_sanitized[k++] = c;
-            }
-            else
-            {
-                // skip non printable
             }
         }
         info_sanitized[k] = '\0';
 
         char device_json[384];
-        int written =
-            snprintf(device_json, sizeof(device_json), "%s{\"busid\":\"%s\",\"info\":\"%s\",\"bound\":%s}",
-                     i > 0 ? "," : "", g_devices[i].busid, info_sanitized, g_devices[i].bound ? "true" : "false");
-        if (written < 0)
-            continue;
-        size_t remaining = buffer_size - strlen(buffer) - 1;
-        if ((size_t)written > remaining)
-        {
-            // No more space; close array and stop
-            strncat(buffer, "]", buffer_size - strlen(buffer) - 1);
-            return;
+        int written = snprintf(device_json, sizeof(device_json),
+            "%s{\"busid\":\"%s\",\"info\":\"%s\",\"bound\":%s}",
+            i > 0 ? "," : "", g_devices[i].busid, info_sanitized,
+            g_devices[i].bound ? "true" : "false");
+            
+        if (written > 0 && pos + written < buffer_size - 1) {
+            memcpy(buffer + pos, device_json, written);
+            pos += written;
         }
-        strncat(buffer, device_json, remaining);
     }
-    strncat(buffer, "]", buffer_size - strlen(buffer) - 1);
+    
+    if (pos < buffer_size - 1) {
+        buffer[pos++] = ']';
+    }
+    buffer[pos] = '\0';
 }
 
 // Send SSE message
-ssize_t send_sse_message(int client_socket, const char *data)
-{
-    // Frame limited to 4KB to avoid truncation warnings and large packets
+ssize_t send_sse_message(int client_socket, const char *data) {
     char response[4096];
-    const size_t prefix_len = 6; // "data: "
-    const size_t suffix_len = 2; // "\n\n"
-    size_t max_payload = sizeof(response) - prefix_len - suffix_len - 1;
-    size_t data_len = strlen(data);
-    if (data_len > max_payload)
-        data_len = max_payload;
-    memcpy(response, "data: ", prefix_len);
-    memcpy(response + prefix_len, data, data_len);
-    response[prefix_len + data_len] = '\n';
-    response[prefix_len + data_len + 1] = '\n';
-    response[prefix_len + data_len + 2] = '\0';
-    return send(client_socket, response, prefix_len + data_len + suffix_len, MSG_NOSIGNAL);
+    size_t data_len = safe_strnlen(data, sizeof(response) - 10);
+    
+    memcpy(response, "data: ", 6);
+    memcpy(response + 6, data, data_len);
+    response[6 + data_len] = '\n';
+    response[7 + data_len] = '\n';
+    response[8 + data_len] = '\0';
+    
+    return send(client_socket, response, 8 + data_len, MSG_NOSIGNAL);
 }
 
 // Send SSE headers
-void send_sse_headers(int client_socket)
-{
+void send_sse_headers(int client_socket) {
     const char *headers = "HTTP/1.1 200 OK\r\n"
                           "Content-Type: text/event-stream\r\n"
                           "Cache-Control: no-cache\r\n"
@@ -1759,33 +1107,26 @@ void send_sse_headers(int client_socket)
     send(client_socket, headers, strlen(headers), MSG_NOSIGNAL);
 }
 
-// Base64 decode function
-static int base64_decode(const char *input, unsigned char *output, int max_len)
-{
+// Base64 decode
+static int base64_decode(const char *input, unsigned char *output, int max_len) {
     const char *table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     int len = 0, i = 0, j = 0;
     unsigned char temp[4];
 
-    while (input[i] && len < max_len - 3)
-    {
-        // Skip whitespace and padding
-        if (input[i] == '=' || input[i] == '\n' || input[i] == '\r' || input[i] == ' ')
-        {
+    while (input[i] && len < max_len - 3) {
+        if (input[i] == '=' || input[i] == '\n' || input[i] == '\r' || input[i] == ' ') {
             i++;
             continue;
         }
 
-        // Find character in table
         const char *p = strchr(table, input[i]);
-        if (!p)
-        {
+        if (!p) {
             i++;
             continue;
         }
         temp[j++] = p - table;
 
-        if (j == 4)
-        {
+        if (j == 4) {
             output[len++] = (temp[0] << 2) | (temp[1] >> 4);
             if (len < max_len)
                 output[len++] = (temp[1] << 4) | (temp[2] >> 2);
@@ -1803,11 +1144,9 @@ static int base64_decode(const char *input, unsigned char *output, int max_len)
 // ============================================================================
 
 // Add SSE client
-void add_sse_client(int socket, struct sockaddr_in addr)
-{
+void add_sse_client(int socket, struct sockaddr_in addr) {
     pthread_mutex_lock(&g_mutex);
-    if (g_client_count < MAX_CLIENTS)
-    {
+    if (g_client_count < MAX_CLIENTS) {
         g_clients[g_client_count].socket = socket;
         g_clients[g_client_count].is_sse = 1;
         g_clients[g_client_count].addr = addr;
@@ -1818,14 +1157,10 @@ void add_sse_client(int socket, struct sockaddr_in addr)
 }
 
 // Remove client
-void remove_client(int socket)
-{
+void remove_client(int socket) {
     pthread_mutex_lock(&g_mutex);
-    for (int i = 0; i < g_client_count; i++)
-    {
-        if (g_clients[i].socket == socket)
-        {
-            // Move last client to this position
+    for (int i = 0; i < g_client_count; i++) {
+        if (g_clients[i].socket == socket) {
             g_clients[i] = g_clients[g_client_count - 1];
             g_client_count--;
             break;
@@ -1834,44 +1169,24 @@ void remove_client(int socket)
     pthread_mutex_unlock(&g_mutex);
 }
 
-// Broadcast to all SSE clients
-void broadcast_devices_update()
-{
+// Broadcast devices update
+void broadcast_devices_update(void) {
     char *json = malloc(JSON_BUFFER_SIZE);
-    if (!json) {
-        log_message("ERROR", "Failed to allocate JSON buffer");
-        return;
-    }
+    if (!json) return;
     
     generate_devices_json(json, JSON_BUFFER_SIZE);
 
     pthread_mutex_lock(&g_mutex);
-
-    // 安全检查：确保客户端列表有效
-    if (g_client_count <= 0)
-    {
-        pthread_mutex_unlock(&g_mutex);
-        return;
-    }
-
-    for (int i = g_client_count - 1; i >= 0; i--)
-    {
-        if (g_clients[i].is_sse)
-        {
-            // Send as SSE message
+    for (int i = g_client_count - 1; i >= 0; i--) {
+        if (g_clients[i].is_sse) {
             ssize_t result = send_sse_message(g_clients[i].socket, json);
-            if (result <= 0)
-            {
+            if (result <= 0) {
                 close(g_clients[i].socket);
-                // Remove client by moving last client to current position
-                if (i < g_client_count - 1)
-                {
+                if (i < g_client_count - 1) {
                     g_clients[i] = g_clients[g_client_count - 1];
                 }
                 g_client_count--;
-            }
-            else
-            {
+            } else {
                 g_clients[i].last_heartbeat = time(NULL);
             }
         }
@@ -1885,44 +1200,33 @@ void broadcast_devices_update()
 // ============================================================================
 
 // Device polling thread
-void *device_poll_thread(void *arg)
-{
-    (void)arg; // Unused parameter
+void *device_poll_thread(void *arg) {
+    (void)arg;
     usb_device_t prev_devices[MAX_DEVICES];
     int prev_count = 0;
 
-    while (g_running)
-    {
-        // Save previous state with lock
+    while (g_running) {
         pthread_mutex_lock(&g_mutex);
         memcpy(prev_devices, g_devices, sizeof(prev_devices));
         prev_count = g_device_count;
         pthread_mutex_unlock(&g_mutex);
 
-        // Update device list
         list_usbip_devices();
 
-        // Check for changes
         int changed = 0;
-        if (prev_count != g_device_count)
-        {
+        if (prev_count != g_device_count) {
             changed = 1;
-        }
-        else
-        {
-            for (int i = 0; i < g_device_count; i++)
-            {
+        } else {
+            for (int i = 0; i < g_device_count; i++) {
                 if (strcmp(prev_devices[i].busid, g_devices[i].busid) != 0 ||
-                    prev_devices[i].bound != g_devices[i].bound)
-                {
+                    prev_devices[i].bound != g_devices[i].bound) {
                     changed = 1;
                     break;
                 }
             }
         }
 
-        if (changed)
-        {
+        if (changed) {
             broadcast_devices_update();
         }
 
@@ -1932,16 +1236,14 @@ void *device_poll_thread(void *arg)
 }
 
 // Handle client request
-void *handle_client(void *arg)
-{
+void *handle_client(void *arg) {
     int client_socket = *(int *)arg;
     free(arg);
 
     char buffer[BUFFER_SIZE];
     ssize_t received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
 
-    if (received <= 0)
-    {
+    if (received <= 0) {
         close(client_socket);
         return NULL;
     }
@@ -1950,56 +1252,50 @@ void *handle_client(void *arg)
 
     // Parse HTTP request
     char method[16], path[256], version[16];
-    sscanf(buffer, "%15s %255s %15s", method, path, version);
+    if (sscanf(buffer, "%15s %255s %15s", method, path, version) != 3) {
+        close(client_socket);
+        return NULL;
+    }
 
     // Handle SSE events endpoint
-    if (strcmp(path, "/events") == 0 && strcmp(method, "GET") == 0)
-    {
-        // Send SSE headers
+    if (strcmp(path, "/events") == 0 && strcmp(method, "GET") == 0) {
         send_sse_headers(client_socket);
 
-        // Add client to SSE clients list
         struct sockaddr_in addr;
         socklen_t addr_len = sizeof(addr);
         getpeername(client_socket, (struct sockaddr *)&addr, &addr_len);
         add_sse_client(client_socket, addr);
 
-        // Send initial device list
         char *json = malloc(JSON_BUFFER_SIZE);
         if (!json) {
-            log_message("ERROR", "Failed to allocate JSON buffer");
             close(client_socket);
             return NULL;
         }
         generate_devices_json(json, JSON_BUFFER_SIZE);
         send_sse_message(client_socket, json);
-        free(json);  // Free allocated JSON buffer
+        free(json);
 
-        // Keep connection alive with periodic heartbeats
 #ifdef PLATFORM_WINDOWS
-        // Windows requires char* for setsockopt and different timeout setting
-        DWORD timeout = 30000; // 30 seconds in milliseconds
+        // Windows: timeout in milliseconds
+        DWORD timeout = 30000; // 30 seconds
         setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
 #else
+        // Unix: timeout as struct timeval
         struct timeval tv;
-        tv.tv_sec = 30; // 30 second timeout for heartbeat
+        tv.tv_sec = 30;
         tv.tv_usec = 0;
         setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 
-        while (g_running)
-        {
+        while (g_running) {
             char dummy_buffer[64];
             ssize_t bytes = recv(client_socket, dummy_buffer, sizeof(dummy_buffer), 0);
-            if (bytes <= 0)
-            {
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                {
-                    // Send heartbeat comment to keep connection alive
-                    send(client_socket, ": heartbeat\\n\\n", 14, MSG_NOSIGNAL);
+            if (bytes <= 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    send(client_socket, ": heartbeat\n\n", 13, MSG_NOSIGNAL);
                     continue;
                 }
-                break; // Client disconnected
+                break;
             }
         }
         remove_client(client_socket);
@@ -2008,218 +1304,123 @@ void *handle_client(void *arg)
     }
 
     // Handle HTTP routes
-    if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0)
-    {
-        int is_head_request = strcmp(method, "HEAD") == 0;
-        if (strcmp(path, "/") == 0)
-        {
-            if (is_head_request)
-            {
+    if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) {
+        int is_head = strcmp(method, "HEAD") == 0;
+        
+        if (strcmp(path, "/") == 0) {
+            if (is_head) {
                 send_http_response(client_socket, 200, "OK", "text/html", "");
+            } else {
+                char *html = malloc(16384);
+                if (html) {
+                    generate_html_page(html, 16384);
+                    send_http_response(client_socket, 200, "OK", "text/html", html);
+                    free(html);
+                }
             }
-            else
-            {
-                char html[16384];
-                generate_html_page(html, sizeof(html));
-                send_http_response(client_socket, 200, "OK", "text/html", html);
-            }
-        }
-        else if (strcmp(path, "/favicon.ico") == 0)
-        {
-            // Decode embedded favicon
+        } else if (strcmp(path, "/favicon.ico") == 0) {
             static unsigned char decoded_favicon[2048];
             static int favicon_len = -1;
 
-            if (favicon_len == -1)
-            {
+            if (favicon_len == -1) {
                 favicon_len = base64_decode(EMBEDDED_FAVICON, decoded_favicon, sizeof(decoded_favicon));
             }
 
-            if (is_head_request)
-            {
-                char response_header[512]; // Increased buffer size
+            if (is_head) {
+                char response_header[512];
                 int header_len = snprintf(response_header, sizeof(response_header),
-                         "HTTP/1.1 200 OK\r\n"
-                         "Content-Type: image/x-icon\r\n"
-                         "Content-Length: %d\r\n"
-                         "Cache-Control: public, max-age=86400\r\n"
-                         "\r\n", favicon_len);
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: image/x-icon\r\n"
+                    "Content-Length: %d\r\n"
+                    "Cache-Control: public, max-age=86400\r\n"
+                    "\r\n", favicon_len);
                 
                 if (header_len > 0 && header_len < (int)sizeof(response_header)) {
                     send(client_socket, response_header, header_len, 0);
                 }
-            }
-            else
-            {
+            } else {
                 char response_header[256];
-                snprintf(response_header, sizeof(response_header),
-                         "HTTP/1.1 200 OK\r\n"
-                         "Content-Type: image/x-icon\r\n"
-                         "Content-Length: %d\r\n"
-                         "Cache-Control: public, max-age=86400\r\n"
-                         "\r\n",
-                         favicon_len);
-                send(client_socket, response_header, strlen(response_header), 0);
-                send(client_socket, (const char *)decoded_favicon, favicon_len, 0);
+                int header_len = snprintf(response_header, sizeof(response_header),
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: image/x-icon\r\n"
+                    "Content-Length: %d\r\n"
+                    "Cache-Control: public, max-age=86400\r\n"
+                    "\r\n", favicon_len);
+                    
+                if (header_len > 0 && header_len < (int)sizeof(response_header)) {
+                    send(client_socket, response_header, header_len, 0);
+                    send(client_socket, (const char *)decoded_favicon, favicon_len, 0);
+                }
             }
-        }
-        else if (strcmp(path, "/api/devices") == 0)
-        {
-            if (is_head_request)
-            {
+        } else if (strcmp(path, "/api/devices") == 0) {
+            if (!is_head) {
+                char *json = malloc(JSON_BUFFER_SIZE);
+                if (json) {
+                    generate_devices_json(json, JSON_BUFFER_SIZE);
+                    send_http_response(client_socket, 200, "OK", "application/json", json);
+                    free(json);
+                }
+            } else {
                 send_http_response(client_socket, 200, "OK", "application/json", "");
             }
-            else
-            {
-                char *json = malloc(JSON_BUFFER_SIZE);
-                if (!json) {
-                    log_message("ERROR", "Failed to allocate JSON buffer");
-                    send_http_response(client_socket, 500, "Internal Server Error", "text/plain", "Memory allocation failed");
-                    close(client_socket);
-                    return NULL;
-                }
-                generate_devices_json(json, JSON_BUFFER_SIZE);
-                send_http_response(client_socket, 200, "OK", "application/json", json);
-                free(json);  // Free allocated JSON buffer
-            }
-        }
-        else
-        {
+        } else {
             send_http_response(client_socket, 404, "Not Found", "text/plain", "404 Not Found");
         }
-    }
-    else if (strcmp(method, "POST") == 0)
-    {
-        // Extract JSON body with safe parsing
+    } else if (strcmp(method, "POST") == 0) {
         char *body = strstr(buffer, "\r\n\r\n");
-        if (body && (body - buffer < (ssize_t)strlen(buffer) - 4))
-        {
+        if (body && (body - buffer < (ssize_t)strlen(buffer) - 4)) {
             body += 4;
-            size_t body_len = strnlen(body, 4096); // Limit body length
+            size_t body_len = safe_strnlen(body, 4096);
             
             if (body_len > 0 && body_len < 4096) {
-                if (strcmp(path, "/bind") == 0)
-                {
-                    // Extract busid from JSON {"busid":"1-1.1"} with safe parsing
+                if (strcmp(path, "/bind") == 0 || strcmp(path, "/unbind") == 0) {
                     char *busid_start = strstr(body, "\"busid\":\"");
-                if (busid_start)
-                {
-                    busid_start += 9;
-                    char *busid_end = strchr(busid_start, '"');
-                    if (busid_end)
-                    {
-                        *busid_end = '\0';
-                        char cmd[256];
-                        char output[1024] = {0};
-                        // Redirect stderr to stdout to capture error messages
-                        snprintf(cmd, sizeof(cmd), "usbip bind -b %s 2>&1", busid_start);
-                        log_message("INFO", "Attempting to bind device: %s", busid_start);
-
-                        if (exec_command(cmd, output, sizeof(output)) == 0)
-                        {
-                            log_message("INFO", "Successfully bound device: %s", busid_start);
-                            // Update device list and generate response with
-                            // devices
-                            list_usbip_devices();
-                            save_config(); // 自动保存配置
-                            char response_json[8192];
-                            char devices_json[4096];
-                            generate_devices_json(devices_json, sizeof(devices_json));
-                            snprintf(response_json, sizeof(response_json), "{\"status\":\"success\",\"devices\":%s}",
-                                     devices_json);
-                            send_http_response(client_socket, 200, "OK", "application/json", response_json);
-                            // Also broadcast update to SSE clients
-                            broadcast_devices_update();
-                        }
-                        else
-                        {
-                            log_message("ERROR", "Failed to bind device: %s", busid_start);
-                            char error_response[2048];
-                            // Clean up the error message
-                            char *clean_output = output;
-                            while (*clean_output == '\n' || *clean_output == '\r' || *clean_output == ' ')
-                                clean_output++;
-                            if (strnlen(clean_output, 256) == 0) {
-                                strncpy(clean_output, "Unknown error", 256 - 1);
-                                clean_output[256 - 1] = '\0';
+                    if (busid_start) {
+                        busid_start += 9;
+                        char *busid_end = strchr(busid_start, '"');
+                        if (busid_end && busid_end - busid_start < 16) {
+                            char busid[16];
+                            size_t busid_len = busid_end - busid_start;
+                            memcpy(busid, busid_start, busid_len);
+                            busid[busid_len] = '\0';
+                            
+                            int is_bind = strcmp(path, "/bind") == 0;
+                            int result = is_bind ? bind_device(busid) : unbind_device(busid);
+                            
+                            if (result) {
+                                list_usbip_devices();
+                                save_config();
+                                
+                                char *response_json = malloc(8192);
+                                if (response_json) {
+                                    char *devices_json = malloc(4096);
+                                    if (devices_json) {
+                                        generate_devices_json(devices_json, 4096);
+                                        snprintf(response_json, 8192, 
+                                                "{\"status\":\"success\",\"devices\":%s}", 
+                                                devices_json);
+                                        send_http_response(client_socket, 200, "OK", 
+                                                         "application/json", response_json);
+                                        free(devices_json);
+                                    }
+                                    free(response_json);
+                                }
+                                broadcast_devices_update();
+                            } else {
+                                send_http_response(client_socket, 500, "Internal Server Error",
+                                                 "application/json", 
+                                                 "{\"status\":\"failed\",\"error\":\"Operation failed\"}");
                             }
-                            snprintf(error_response, sizeof(error_response), "{\"status\":\"failed\",\"error\":\"%s\"}",
-                                     clean_output);
-                            send_http_response(client_socket, 500, "Internal Server Error", "application/json",
-                                               error_response);
                         }
-                        // Trigger immediate update
-                        list_usbip_devices();
-                        broadcast_devices_update();
                     }
+                } else {
+                    send_http_response(client_socket, 404, "Not Found", "text/plain", "404 Not Found");
                 }
-                }
-            }
-            else if (strcmp(path, "/unbind") == 0)
-            {
-                // Extract busid from JSON
-                char *busid_start = strstr(body, "\"busid\":\"");
-                if (busid_start)
-                {
-                    busid_start += 9;
-                    char *busid_end = strchr(busid_start, '"');
-                    if (busid_end)
-                    {
-                        *busid_end = '\0';
-                        char cmd[256];
-                        char output[1024] = {0};
-                        // Redirect stderr to stdout to capture error messages
-                        snprintf(cmd, sizeof(cmd), "usbip unbind -b %s 2>&1", busid_start);
-                        log_message("INFO", "Attempting to unbind device: %s", busid_start);
-
-                        if (exec_command(cmd, output, sizeof(output)) == 0)
-                        {
-                            log_message("INFO", "Successfully unbound device: %s", busid_start);
-                            // Update device list and generate response with
-                            // devices
-                            list_usbip_devices();
-                            save_config(); // 自动保存配置
-                            char response_json[8192];
-                            char devices_json[4096];
-                            generate_devices_json(devices_json, sizeof(devices_json));
-                            snprintf(response_json, sizeof(response_json), "{\"status\":\"success\",\"devices\":%s}",
-                                     devices_json);
-                            send_http_response(client_socket, 200, "OK", "application/json", response_json);
-                            // Also broadcast update to SSE clients
-                            broadcast_devices_update();
-                        }
-                        else
-                        {
-                            log_message("ERROR", "Failed to unbind device: %s", busid_start);
-                            char error_response[2048];
-                            // Clean up the error message
-                            char *clean_output = output;
-                            while (*clean_output == '\n' || *clean_output == '\r' || *clean_output == ' ')
-                                clean_output++;
-                            if (strnlen(clean_output, 256) == 0) {
-                                strncpy(clean_output, "Unknown error", 256 - 1);
-                                clean_output[256 - 1] = '\0';
-                            }
-                            snprintf(error_response, sizeof(error_response), "{\"status\":\"failed\",\"error\":\"%s\"}",
-                                     clean_output);
-                            send_http_response(client_socket, 500, "Internal Server Error", "application/json",
-                                               error_response);
-                        }
-                        // Trigger immediate update
-                        list_usbip_devices();
-                        broadcast_devices_update();
-                    }
-                }
-            }
-            else
-            {
-                send_http_response(client_socket, 404, "Not Found", "text/plain", "404 Not Found");
             }
         }
-    }
-    else
-    {
-        send_http_response(client_socket, 405, "Method Not Allowed", "text/plain", "405 Method Not Allowed");
+    } else {
+        send_http_response(client_socket, 405, "Method Not Allowed", "text/plain", 
+                          "405 Method Not Allowed");
     }
 
     close(client_socket);
@@ -2227,13 +1428,24 @@ void *handle_client(void *arg)
 }
 
 // Main server loop
-void *server_thread(void *arg)
-{
-    (void)arg; // Unused parameter
+void *server_thread(void *arg) {
+    (void)arg;
+    
+#ifdef PLATFORM_WINDOWS
+    // Initialize Windows Sockets
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        fprintf(stderr, "WSAStartup failed\n");
+        return NULL;
+    }
+#endif
+    
     int server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_socket < 0)
-    {
+    if (server_socket < 0) {
         perror("Socket creation failed");
+#ifdef PLATFORM_WINDOWS
+        WSACleanup();
+#endif
         exit(1);
     }
 
@@ -2250,403 +1462,215 @@ void *server_thread(void *arg)
     server_addr.sin_addr.s_addr = inet_addr(g_config.bind_address);
     server_addr.sin_port = htons(g_config.port);
 
-    if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
-    {
+    if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("Bind failed");
         close(server_socket);
+#ifdef PLATFORM_WINDOWS
+        WSACleanup();
+#endif
         exit(1);
     }
 
-    if (listen(server_socket, 10) < 0)
-    {
+    if (listen(server_socket, 10) < 0) {
         perror("Listen failed");
         close(server_socket);
+#ifdef PLATFORM_WINDOWS
+        WSACleanup();
+#endif
         exit(1);
     }
 
-    // Get and display startup information
     char *local_ip = get_local_ip();
-    printf("\n🚀 usbctl v%s server started successfully!\n", VERSION);
-    printf("📡 Server: %s:%d\n", g_config.bind_address, g_config.port);
-    printf("🌐 Web interface URLs:\n");
-    printf("   http://localhost:%d\n", g_config.port);
-    if (strcmp(local_ip, "localhost") != 0)
-    {
-        printf("   http://%s:%d\n", local_ip, g_config.port);
-    }
-    if (strcmp(g_config.bind_address, "0.0.0.0") != 0 && strcmp(g_config.bind_address, local_ip) != 0)
-    {
-        printf("   http://%s:%d\n", g_config.bind_address, g_config.port);
-    }
-    printf("📊 Status: Ready for connections\n");
-    printf("📝 Logs: %s\n", g_config.verbose_logging ? g_config.log_file : "disabled");
-    printf("\n⚠️  Press Ctrl+C to stop the server gracefully\n");
-    printf("💡 Or send SIGTERM signal to process for clean shutdown\n\n");
+    printf("\nServer started on %s:%d\n", g_config.bind_address, g_config.port);
+    printf("Web interface: http://%s:%d\n", local_ip, g_config.port);
+    printf("Press Ctrl+C to stop\n\n");
 
-    log_message("INFO", "Server started on %s:%d", g_config.bind_address, g_config.port);
-    log_message("INFO", "Web interface available at multiple URLs");
-
-    while (g_running)
-    {
-        // Use select with timeout to make accept interruptible
+    while (g_running) {
         fd_set readfds;
         struct timeval timeout;
 
         FD_ZERO(&readfds);
         FD_SET(server_socket, &readfds);
-        timeout.tv_sec = 1; // 1 second timeout
+        timeout.tv_sec = 1;
         timeout.tv_usec = 0;
 
         int ready = select(server_socket + 1, &readfds, NULL, NULL, &timeout);
 
-        if (ready < 0)
-        {
-            if (errno == EINTR)
-            {
-                // Signal interrupted select - check if we should exit
-                continue;
-            }
-            if (g_running)
-            {
-                perror("Select failed");
-            }
+        if (ready < 0) {
+#ifdef PLATFORM_WINDOWS
+            if (WSAGetLastError() == WSAEINTR) continue;
+#else
+            if (errno == EINTR) continue;
+#endif
+            if (g_running) perror("Select failed");
             break;
         }
 
-        if (ready == 0)
-        {
-            // Timeout - continue loop to check g_running
-            continue;
-        }
-
-        if (!FD_ISSET(server_socket, &readfds))
-        {
-            continue;
-        }
+        if (ready == 0) continue;
+        if (!FD_ISSET(server_socket, &readfds)) continue;
 
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
 
-        if (client_socket < 0)
-        {
-            if (g_running)
-                perror("Accept failed");
+        if (client_socket < 0) {
+            if (g_running) perror("Accept failed");
             continue;
         }
 
-        // Create thread to handle client
         pthread_t client_thread;
         int *socket_ptr = malloc(sizeof(int));
+        if (!socket_ptr) {
+            close(client_socket);
+            continue;
+        }
         *socket_ptr = client_socket;
 
-        if (pthread_create(&client_thread, NULL, handle_client, socket_ptr) != 0)
-        {
+        if (pthread_create(&client_thread, NULL, handle_client, socket_ptr) != 0) {
             perror("Thread creation failed");
             close(client_socket);
             free(socket_ptr);
-        }
-        else
-        {
+        } else {
             pthread_detach(client_thread);
         }
     }
 
     close(server_socket);
+    
+#ifdef PLATFORM_WINDOWS
+    WSACleanup();
+#endif
+    
     return NULL;
 }
 
 // ============================================================================
-// COMMAND LINE INTERFACE
+// MAIN
 // ============================================================================
 
-void print_usage()
-{
+void print_usage(void) {
     printf("usbctl v%s - USB/IP Device Web Manager\n", VERSION);
     printf("Author: %s\n\n", AUTHOR);
-    printf("Usage: usbctl [OPTIONS] [COMMANDS]\n\n");
-    printf("Web Server Options:\n");
+    printf("Usage: usbctl [OPTIONS]\n\n");
+    printf("Options:\n");
     printf("  -p, --port PORT        Server port (default: %d)\n", DEFAULT_PORT);
     printf("  -b, --bind ADDRESS     Bind address (default: %s)\n", DEFAULT_BIND);
     printf("  -i, --interval SEC     Polling interval (default: 3)\n");
     printf("  -c, --config PATH      Configuration file path\n");
     printf("  -v, --verbose          Enable verbose logging\n");
-    printf("  -q, --quiet            Disable logging output\n\n");
-    printf("Commands:\n");
-    printf("  --list                 List USB devices (JSON format)\n");
-    printf("  --bind BUSID           Bind USB device\n");
-    printf("  --unbind BUSID         Unbind USB device\n");
-    printf("  --init-config          Create default configuration\n");
-    printf("  --print-config         Show current configuration\n");
-    printf("  --version              Show version information\n");
+    printf("  --version              Show version\n");
     printf("  --help                 Show this help\n\n");
     printf("Examples:\n");
-    printf("  usbctl                 # Start web server (best practice "
-           "defaults)\n");
-    printf("  usbctl -p 8080         # Start server on port 8080\n");
+    printf("  usbctl                 # Start web server\n");
+    printf("  usbctl -p 8080         # Start on port 8080\n");
     printf("  usbctl -v              # Start with verbose logging\n");
-    printf("  usbctl --list          # List available USB devices\n");
-    printf("  usbctl --bind 1-1.1    # Bind specific device\n\n");
-    printf("Default configuration follows convention over configuration "
-           "principle.\n");
 }
 
-void print_version()
-{
-    printf("usbctl version %s\n", VERSION);
-    printf("USB/IP device web manager for Linux\n");
-    printf("Author: %s\n", AUTHOR);
-    printf("\nFeatures:\n");
-    printf("  * Web-based device management\n");
-    printf("  * Real-time status updates\n");
-    printf("  * ARM Linux optimized\n");
-    printf("  * Zero-dependency deployment\n");
-}
-
-void print_config()
-{
-    printf("Current configuration:\n");
-    printf("  Port: %d\n", g_config.port);
-    printf("  Bind Address: %s\n", g_config.bind_address);
-    printf("  Poll Interval: %d seconds\n", g_config.poll_interval);
-    printf("  Config File: %s\n", g_config.config_path);
-}
-
-
-
-// Signal handler for graceful shutdown
-void signal_handler(int sig)
-{
+void signal_handler(int sig) {
+    (void)sig; // Suppress unused parameter warning
     static int shutdown_count = 0;
-
     shutdown_count++;
-    if (shutdown_count == 1)
-    {
-        if (sig == SIGINT)
-        {
-            printf("\n\n⏹️  Received interrupt signal (Ctrl+C)\n");
-        }
-        else
-        {
-            printf("\n\n⏹️  Received termination signal (%d)\n", sig);
-        }
-        printf("🔄 Shutting down usbctl server gracefully...\n");
-
+    
+    if (shutdown_count == 1) {
+        printf("\nShutting down gracefully...\n");
         g_running = 0;
-
-        // Close all client connections immediately
-        for (int i = 0; i < g_client_count; i++)
-        {
-            if (g_clients[i].socket > 0)
-            {
+        
+        for (int i = 0; i < g_client_count; i++) {
+            if (g_clients[i].socket > 0) {
                 close(g_clients[i].socket);
                 g_clients[i].socket = -1;
             }
         }
         g_client_count = 0;
-
-        printf("✅ Server stopped successfully.\n");
+        
+        printf("Server stopped\n");
         fflush(stdout);
-        exit(0); // Exit immediately without delay
-    }
-    else
-    {
-        printf("\n💥 Force exit after multiple signals\n");
-        _exit(1); // Force exit without cleanup
+        exit(0);
+    } else {
+        printf("\nForce exit\n");
+        _exit(1);
     }
 }
 
-// ============================================================================
-// MAIN FUNCTION
-// ============================================================================
-
-int main(int argc, char *argv[])
-{
+int main(int argc, char *argv[]) {
+#ifdef PLATFORM_WINDOWS
+    // Initialize critical section for Windows
+    InitializeCriticalSection(&g_mutex);
+#endif
+    
     init_config();
-    // Load configuration
     load_config();
-    // Parse command line arguments first to check for immediate commands
-    for (int i = 1; i < argc; i++)
-    {
-        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)
-        {
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage();
             return 0;
-        }
-        else if (strcmp(argv[i], "--version") == 0)
-        {
-            print_version();
+        } else if (strcmp(argv[i], "--version") == 0) {
+            printf("usbctl version %s\n", VERSION);
             return 0;
-        }
-        else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0)
-        {
+        } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
             g_config.verbose_logging = 1;
-        }
-        else if (strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "-q") == 0)
-        {
-            g_config.verbose_logging = 0;
-        }
-        else if (strcmp(argv[i], "--list") == 0)
-        {
-            // Initialize logging for single command
-            init_logging();
-            if (!check_system_compatibility())
-            {
-                fprintf(stderr, "System compatibility check failed\n");
-                return 1;
+        } else if (strcmp(argv[i], "--port") == 0 || strcmp(argv[i], "-p") == 0) {
+            if (++i < argc) g_config.port = atoi(argv[i]);
+        } else if (strcmp(argv[i], "--bind") == 0 || strcmp(argv[i], "-b") == 0) {
+            if (++i < argc) {
+                size_t len = safe_strnlen(argv[i], sizeof(g_config.bind_address) - 1);
+                memcpy(g_config.bind_address, argv[i], len);
+                g_config.bind_address[len] = '\0';
             }
-
-            list_usbip_devices();
-            char *json = malloc(JSON_BUFFER_SIZE);
-            if (!json) {
-                fprintf(stderr, "Failed to allocate JSON buffer\n");
-                return 1;
+        } else if (strcmp(argv[i], "--interval") == 0 || strcmp(argv[i], "-i") == 0) {
+            if (++i < argc) g_config.poll_interval = atoi(argv[i]);
+        } else if (strcmp(argv[i], "--config") == 0 || strcmp(argv[i], "-c") == 0) {
+            if (++i < argc) {
+                size_t len = safe_strnlen(argv[i], sizeof(g_config.config_path) - 1);
+                memcpy(g_config.config_path, argv[i], len);
+                g_config.config_path[len] = '\0';
             }
-            generate_devices_json(json, JSON_BUFFER_SIZE);
-            printf("%s\n", json);
-            free(json);
-            return 0;
-        }
-        else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc)
-        {
-            init_logging();
-            if (!check_system_compatibility())
-            {
-                fprintf(stderr, "System compatibility check failed\n");
-                return 1;
-            }
-
-            if (bind_device(argv[++i]))
-            {
-                printf("Device bound successfully\n");
-                return 0;
-            }
-            else
-            {
-                printf("Failed to bind device\n");
-                return 1;
-            }
-        }
-        else if (strcmp(argv[i], "--unbind") == 0 && i + 1 < argc)
-        {
-            init_logging();
-            if (!check_system_compatibility())
-            {
-                fprintf(stderr, "System compatibility check failed\n");
-                return 1;
-            }
-
-            if (unbind_device(argv[++i]))
-            {
-                printf("Device unbound successfully\n");
-                return 0;
-            }
-            else
-            {
-                printf("Failed to unbind device\n");
-                return 1;
-            }
-        }
-        else if (strcmp(argv[i], "--init-config") == 0)
-        {
-            save_config();
-            printf("Configuration file created: %s\n", g_config.config_path);
-            return 0;
-        }
-        else if (strcmp(argv[i], "--print-config") == 0)
-        {
-            load_config();
-            print_config();
-            return 0;
-        }
-        else if (strcmp(argv[i], "--port") == 0 || strcmp(argv[i], "-p") == 0)
-        {
-            if (++i < argc)
-                g_config.port = atoi(argv[i]);
-        }
-        else if (strcmp(argv[i], "--bind") == 0 || strcmp(argv[i], "-b") == 0)
-        {
-            if (++i < argc)
-                strncpy(g_config.bind_address, argv[i], sizeof(g_config.bind_address) - 1);
-        }
-        else if (strcmp(argv[i], "--interval") == 0 || strcmp(argv[i], "-i") == 0)
-        {
-            if (++i < argc)
-                g_config.poll_interval = atoi(argv[i]);
-        }
-        else if (strcmp(argv[i], "--config") == 0 || strcmp(argv[i], "-c") == 0)
-        {
-            if (++i < argc)
-                strncpy(g_config.config_path, argv[i], sizeof(g_config.config_path) - 1);
         }
     }
 
-
-    // Initialize platform-specific networking
-    if (!init_platform_networking())
-    {
-        fprintf(stderr, "Failed to initialize platform networking\n");
-        return 1;
-    }
-
-    // Initialize logging system
-    if (!init_logging())
-    {
-        fprintf(stderr, "Failed to initialize logging system\n");
-        cleanup_platform_networking();
-        return 1;
-    }
-
-    // Check system compatibility
-    if (!check_system_compatibility())
-    {
-        fprintf(stderr, "System compatibility check failed\n");
-        cleanup_platform_networking();
+    if (!init_logging()) {
+        fprintf(stderr, "Failed to initialize logging\n");
         return 1;
     }
 
     log_message("INFO", "Starting usbctl v%s", VERSION);
-    log_message("INFO", "Author: %s", AUTHOR);
 
-    // Initial device list
     list_usbip_devices();
 
-    // Restore bound devices from configuration (for system restart recovery)
-    if (g_config.bound_devices_count > 0)
-    {
-        log_message("INFO", "Restoring bound devices from configuration");
+    if (g_config.bound_devices_count > 0) {
         restore_bound_devices();
-        // Refresh device list to update bound states
         list_usbip_devices();
     }
 
-    // Setup signal handling for graceful shutdown (non-restarting)
+#ifndef PLATFORM_WINDOWS
     struct sigaction sa;
     sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0; // Don't restart interrupted system calls
+    sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
-    signal(SIGPIPE, SIG_IGN); // Ignore broken pipe signals
+    signal(SIGPIPE, SIG_IGN);
+#else
+    signal_compat(SIGINT, signal_handler);
+    signal_compat(SIGTERM, signal_handler);
+#endif
 
-    // Mark server as started to reduce verbose logging in polling thread
     g_server_started = 1;
 
-    // Start device polling thread
     pthread_t poll_thread;
-    if (pthread_create(&poll_thread, NULL, device_poll_thread, NULL) != 0)
-    {
+    if (pthread_create(&poll_thread, NULL, device_poll_thread, NULL) != 0) {
         log_message("ERROR", "Failed to create polling thread");
         return 1;
     }
 
-    // Start server thread (runs in main thread)
     server_thread(NULL);
 
-    // Cleanup
     pthread_join(poll_thread, NULL);
-    cleanup_platform_networking();
 
-    printf("usbctl server stopped.\n");
+#ifdef PLATFORM_WINDOWS
+    DeleteCriticalSection(&g_mutex);
+#endif
+
     return 0;
 }
