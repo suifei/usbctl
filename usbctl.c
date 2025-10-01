@@ -34,15 +34,7 @@
 #define close(s) closesocket(s)
 #define ssize_t int
 #define sleep(x) Sleep(x * 1000)
-// Secure popen/pclose definitions for Windows
-#ifdef _MSC_VER
-#define popen(cmd, mode) _popen(cmd, mode)
-#define pclose(fp) _pclose(fp)
-#else
-// For MinGW/GCC on Windows
-#define popen(cmd, mode) _popen(cmd, mode)
-#define pclose(fp) _pclose(fp)
-#endif
+// Note: popen/pclose usage controlled by secure_exec_command function
 #define mkdir(path, mode) _mkdir(path)
 #define PATH_SEPARATOR "\\"
 // Windows-specific missing definitions
@@ -516,6 +508,12 @@ const char *EMBEDDED_HTML = "<!DOCTYPE html><html lang=\"en\"><head><meta charse
 
 void log_message(const char *level, const char *format, ...);
 
+// Secure command execution function
+static int secure_exec_command(const char *cmd, char *output, size_t output_size);
+
+// Validate command for safety (basic sanitization)
+static int validate_command(const char *cmd);
+
 // Safe strnlen implementation for systems that don't have it
 #ifndef HAVE_STRNLEN
 static size_t safe_strnlen(const char *s, size_t maxlen) {
@@ -581,7 +579,7 @@ static int validate_command(const char *cmd) {
     const char *dangerous_chars = ";|&`$(){}[]<>";
     for (const char *p = dangerous_chars; *p; p++) {
         if (strchr(cmd, *p)) {
-            log_message("ERROR", "Dangerous character '%c' found in command", *p);
+            log_message("ERROR", "Dangerous character found in command");
             return 0;
         }
     }
@@ -597,8 +595,62 @@ static int validate_command(const char *cmd) {
         }
     }
     
-    log_message("ERROR", "Command not in allowed list: %s", cmd);
+    log_message("ERROR", "Command not in allowed list");
     return 0;
+}
+
+// Secure command execution with enhanced validation
+static int secure_exec_command(const char *cmd, char *output, size_t output_size) {
+    if (!cmd || !output || output_size == 0) {
+        log_message("ERROR", "Invalid arguments for secure_exec_command");
+        return -1;
+    }
+    
+    // Validate command for safety
+    if (!validate_command(cmd)) {
+        log_message("ERROR", "Command validation failed: %.*s", 50, cmd);
+        return -1;
+    }
+    
+    // Clear output buffer
+    memset(output, 0, output_size);
+    
+#ifdef _WIN32
+    FILE *fp = _popen(cmd, "r");
+#else
+    FILE *fp = popen(cmd, "r");
+#endif
+    
+    if (!fp) {
+        log_message("ERROR", "Failed to execute command");
+        return -1;
+    }
+    
+    size_t total = 0;
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), fp) && total < output_size - 1) {
+        size_t len = strnlen(buffer, sizeof(buffer));
+        if (total + len < output_size - 1) {
+            memcpy(output + total, buffer, len);
+            total += len;
+        } else {
+            break; // Prevent overflow
+        }
+    }
+    output[total] = '\0';
+    
+#ifdef _WIN32
+    int result = _pclose(fp);
+#else
+    int result = pclose(fp);
+#endif
+    
+    // Only log command output during startup or if verbose logging enabled
+    if (!g_server_started || g_config.verbose_logging) {
+        log_message("DEBUG", "Command executed successfully");
+    }
+    
+    return WEXITSTATUS(result);
 }
 
 // ============================================================================
@@ -628,7 +680,7 @@ int init_logging()
 // Log message with timestamp
 void log_message(const char *level, const char *format, ...)
 {
-    if (!g_log_file)
+    if (!g_log_file || !level || !format)
         return;
 
     time_t now = time(NULL);
@@ -636,7 +688,16 @@ void log_message(const char *level, const char *format, ...)
     char timestamp[32];
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
 
-    fprintf(g_log_file, "[%s] %s: ", timestamp, level);
+    // Sanitize level parameter to prevent format string attacks
+    char safe_level[16];
+    if (strnlen(level, sizeof(safe_level)) >= sizeof(safe_level)) {
+        strncpy(safe_level, "TOOLONG", sizeof(safe_level) - 1);
+    } else {
+        strncpy(safe_level, level, sizeof(safe_level) - 1);
+    }
+    safe_level[sizeof(safe_level) - 1] = '\0';
+
+    fprintf(g_log_file, "[%s] %s: ", timestamp, safe_level);
 
     va_list args;
     va_start(args, format);
@@ -1072,46 +1133,7 @@ int is_device_configured_as_bound(const char *busid)
 // Execute command and capture output - with enhanced security
 int exec_command(const char *cmd, char *output, size_t output_size)
 {
-    if (!cmd || !output || output_size == 0)
-    {
-        log_message("ERROR", "Invalid arguments for exec_command");
-        return -1;
-    }
-    
-    // Validate command for safety
-    if (!validate_command(cmd)) {
-        log_message("ERROR", "Command validation failed: %s", cmd);
-        return -1;
-    }
-
-    FILE *fp = popen(cmd, "r");
-    if (!fp)
-    {
-        log_message("ERROR", "Failed to execute command: %s", cmd);
-        return -1;
-    }
-
-    size_t total = 0;
-    char buffer[256];
-    while (fgets(buffer, sizeof(buffer), fp) && total < output_size - 1)
-    {
-        size_t len = strlen(buffer);
-        if (total + len < output_size - 1)
-        {
-            strncpy(output + total, buffer, output_size - 1 - total);
-            output[output_size - 1] = '\0'; // Ensure null termination
-            total += len;
-        }
-    }
-    output[total] = '\0';
-
-    int result = pclose(fp);
-    // Only log command output during startup or if verbose logging enabled
-    if (!g_server_started || g_config.verbose_logging)
-    {
-        log_message("DEBUG", "Command output: %s", output);
-    }
-    return WEXITSTATUS(result);
+    return secure_exec_command(cmd, output, output_size);
 }
 
 // Check device binding status - safer version without TOCTOU race condition
@@ -1506,25 +1528,48 @@ void generate_html_page(char *buffer, size_t buffer_size)
     snprintf(buffer, buffer_size, EMBEDDED_HTML, EMBEDDED_CSS, LOGO_SVG, EMBEDDED_JS);
 }
 
-// Send HTTP response
+// Send HTTP response - with enhanced security
 void send_http_response(int client_socket, int status_code, const char *status_text, const char *content_type,
                         const char *body)
 {
-    char header[512];
-    int body_len = body ? strlen(body) : 0;
+    if (client_socket < 0) {
+        log_message("ERROR", "Invalid client socket");
+        return;
+    }
+    
+    // Validate and sanitize parameters
+    const char *safe_status_text = status_text ? status_text : "Unknown";
+    const char *safe_content_type = content_type ? content_type : "text/plain";
+    
+    char header[1024]; // Increased buffer size for safety
+    int body_len = body ? strnlen(body, 1024*1024) : 0; // Limit body length check
 
-    snprintf(header, sizeof(header),
+    int header_len = snprintf(header, sizeof(header),
              "HTTP/1.1 %d %s\r\n"
              "Content-Type: %s\r\n"
              "Content-Length: %d\r\n"
              "Connection: close\r\n"
+             "X-Content-Type-Options: nosniff\r\n"
+             "X-Frame-Options: DENY\r\n"
              "\r\n",
-             status_code, status_text, content_type, body_len);
+             status_code, safe_status_text, safe_content_type, body_len);
 
-    send(client_socket, header, strlen(header), 0);
-    if (body)
-    {
-        send(client_socket, body, body_len, 0);
+    if (header_len >= (int)sizeof(header)) {
+        log_message("ERROR", "HTTP header too large");
+        return;
+    }
+
+    ssize_t sent = send(client_socket, header, header_len, 0);
+    if (sent < 0) {
+        log_message("ERROR", "Failed to send HTTP header");
+        return;
+    }
+    
+    if (body && body_len > 0) {
+        sent = send(client_socket, body, body_len, 0);
+        if (sent < 0) {
+            log_message("ERROR", "Failed to send HTTP body");
+        }
     }
 }
 
@@ -1988,8 +2033,10 @@ void *handle_client(void *arg)
                             char *clean_output = output;
                             while (*clean_output == '\n' || *clean_output == '\r' || *clean_output == ' ')
                                 clean_output++;
-                            if (strlen(clean_output) == 0)
-                                strcpy(clean_output, "Unknown error");
+                            if (strnlen(clean_output, 256) == 0) {
+                                strncpy(clean_output, "Unknown error", 256 - 1);
+                                clean_output[256 - 1] = '\0';
+                            }
                             snprintf(error_response, sizeof(error_response), "{\"status\":\"failed\",\"error\":\"%s\"}",
                                      clean_output);
                             send_http_response(client_socket, 500, "Internal Server Error", "application/json",
@@ -2042,8 +2089,10 @@ void *handle_client(void *arg)
                             char *clean_output = output;
                             while (*clean_output == '\n' || *clean_output == '\r' || *clean_output == ' ')
                                 clean_output++;
-                            if (strlen(clean_output) == 0)
-                                strcpy(clean_output, "Unknown error");
+                            if (strnlen(clean_output, 256) == 0) {
+                                strncpy(clean_output, "Unknown error", 256 - 1);
+                                clean_output[256 - 1] = '\0';
+                            }
                             snprintf(error_response, sizeof(error_response), "{\"status\":\"failed\",\"error\":\"%s\"}",
                                      clean_output);
                             send_http_response(client_socket, 500, "Internal Server Error", "application/json",
