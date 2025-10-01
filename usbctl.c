@@ -34,8 +34,15 @@
 #define close(s) closesocket(s)
 #define ssize_t int
 #define sleep(x) Sleep(x * 1000)
+// Secure popen/pclose definitions for Windows
+#ifdef _MSC_VER
 #define popen(cmd, mode) _popen(cmd, mode)
 #define pclose(fp) _pclose(fp)
+#else
+// For MinGW/GCC on Windows
+#define popen(cmd, mode) _popen(cmd, mode)
+#define pclose(fp) _pclose(fp)
+#endif
 #define mkdir(path, mode) _mkdir(path)
 #define PATH_SEPARATOR "\\"
 // Windows-specific missing definitions
@@ -509,6 +516,17 @@ const char *EMBEDDED_HTML = "<!DOCTYPE html><html lang=\"en\"><head><meta charse
 
 void log_message(const char *level, const char *format, ...);
 
+// Safe strnlen implementation for systems that don't have it
+#ifndef HAVE_STRNLEN
+static size_t safe_strnlen(const char *s, size_t maxlen) {
+    if (!s) return 0;
+    const char *p = s;
+    while (maxlen-- > 0 && *p) p++;
+    return p - s;
+}
+#define strnlen safe_strnlen
+#endif
+
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
@@ -531,20 +549,22 @@ static int safe_executable_exists(const char *path) {
 
 // Validate environment variable content for safety
 static int validate_env_path(const char *path) {
-    if (!path || strlen(path) == 0) {
+    if (!path) {
         return 0;
     }
     
-    // Check path length
-    if (strlen(path) > 1024) {
-        log_message("WARN", "Environment path too long, using default");
+    // Safe length check to prevent potential over-read
+    size_t len = strnlen(path, 2048);  // Use strnlen for safety
+    if (len == 0 || len >= 2048) {
+        log_message("WARN", "Environment path invalid length, using default");
         return 0;
     }
     
     // Check for dangerous characters
     const char *dangerous = "\r\n\0";
     for (const char *p = dangerous; *p; p++) {
-        if (strchr(path, *p)) {
+        // Use memchr for safer character search
+        if (memchr(path, *p, len)) {
             log_message("WARN", "Dangerous character in environment path, using default");
             return 0;
         }
@@ -1097,22 +1117,30 @@ int exec_command(const char *cmd, char *output, size_t output_size)
 // Check device binding status - safer version without TOCTOU race condition
 int is_device_bound(const char *busid)
 {
-    if (!busid || strlen(busid) == 0) {
+    if (!busid) {
         return 0; // Invalid busid
     }
     
+    // Safe length check to prevent over-read
+    size_t busid_len = strnlen(busid, 64);  // Reasonable max busid length
+    if (busid_len == 0 || busid_len >= 64) {
+        log_message("WARN", "Invalid busid length");
+        return 0;
+    }
+    
     // Validate busid format (should be like "1-1.2")
-    for (const char *p = busid; *p; p++) {
-        if (!(*p >= '0' && *p <= '9') && *p != '-' && *p != '.') {
-            log_message("WARN", "Invalid busid format: %s", busid);
+    for (size_t i = 0; i < busid_len; i++) {
+        char c = busid[i];
+        if (!(c >= '0' && c <= '9') && c != '-' && c != '.') {
+            log_message("WARN", "Invalid busid format: %.*s", (int)busid_len, busid);
             return 0;
         }
     }
     
     char path[256];
-    int ret = snprintf(path, sizeof(path), "/sys/bus/usb/drivers/usbip-host/%s", busid);
-    if (ret >= (int)sizeof(path)) {
-        log_message("ERROR", "Path too long for busid: %s", busid);
+    int ret = snprintf(path, sizeof(path), "/sys/bus/usb/drivers/usbip-host/%.*s", (int)busid_len, busid);
+    if (ret >= (int)sizeof(path) || ret < 0) {
+        log_message("ERROR", "Path construction failed for busid");
         return 0;
     }
     
