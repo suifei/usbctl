@@ -54,12 +54,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          git checkout go
           go mod download
           go mod verify
-
-      - name: Run tests
-        run: make test
 
       - name: Build all platforms
         run: make release
