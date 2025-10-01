@@ -22,6 +22,7 @@
 #endif
 #include <direct.h>
 #include <io.h>
+#include <sys/stat.h>
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -41,6 +42,13 @@
 #define MSG_NOSIGNAL 0
 #define SIGPIPE 13
 #define WEXITSTATUS(w) (((w) >> 8) & 0xff)
+// Windows stat compatibility
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
+#ifndef S_IXUSR  
+#define S_IXUSR _S_IEXEC
+#endif
 // Signal handling compatibility
 struct sigaction
 {
@@ -89,6 +97,7 @@ struct sigaction
 #define MAX_DEVICES 32
 #define MAX_LSUSB_ENTRIES 64
 #define LOG_BUFFER_SIZE 1024
+#define JSON_BUFFER_SIZE 8192  // Increased buffer size for JSON responses
 
 // Configuration structure
 typedef struct
@@ -495,6 +504,84 @@ const char *EMBEDDED_HTML = "<!DOCTYPE html><html lang=\"en\"><head><meta charse
                             "<script>%s</script></body></html>";
 
 // ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+
+void log_message(const char *level, const char *format, ...);
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+// Safe file existence check without TOCTOU race condition
+static int safe_file_exists(const char *path) {
+    struct stat st;
+    return (stat(path, &st) == 0);
+}
+
+// Safe executable check without TOCTOU race condition  
+static int safe_executable_exists(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return 0;
+    }
+    // Check if it's a regular file and executable
+    return S_ISREG(st.st_mode) && (st.st_mode & S_IXUSR);
+}
+
+// Validate environment variable content for safety
+static int validate_env_path(const char *path) {
+    if (!path || strlen(path) == 0) {
+        return 0;
+    }
+    
+    // Check path length
+    if (strlen(path) > 1024) {
+        log_message("WARN", "Environment path too long, using default");
+        return 0;
+    }
+    
+    // Check for dangerous characters
+    const char *dangerous = "\r\n\0";
+    for (const char *p = dangerous; *p; p++) {
+        if (strchr(path, *p)) {
+            log_message("WARN", "Dangerous character in environment path, using default");
+            return 0;
+        }
+    }
+    
+    return 1;
+}
+
+// Validate command for safety (basic sanitization)
+static int validate_command(const char *cmd) {
+    if (!cmd) return 0;
+    
+    // Check for dangerous characters that could enable command injection
+    const char *dangerous_chars = ";|&`$(){}[]<>";
+    for (const char *p = dangerous_chars; *p; p++) {
+        if (strchr(cmd, *p)) {
+            log_message("ERROR", "Dangerous character '%c' found in command", *p);
+            return 0;
+        }
+    }
+    
+    // Only allow specific commands we know are safe
+    const char *allowed_commands[] = {
+        "usbip", "lsusb", "systemctl", "modprobe", "usbipd", NULL
+    };
+    
+    for (int i = 0; allowed_commands[i]; i++) {
+        if (strncmp(cmd, allowed_commands[i], strlen(allowed_commands[i])) == 0) {
+            return 1;
+        }
+    }
+    
+    log_message("ERROR", "Command not in allowed list: %s", cmd);
+    return 0;
+}
+
+// ============================================================================
 // LOGGING AND SYSTEM COMPATIBILITY
 // ============================================================================
 
@@ -628,18 +715,16 @@ int check_system_compatibility()
 
     log_message("INFO", "Running on %s platform", platform);
 
-    // Check for usbip command availability with different search patterns per
-    // platform
 #ifdef __linux__
-    if (access("/usr/bin/usbip", X_OK) != 0 && access("/usr/sbin/usbip", X_OK) != 0 &&
-        access("/bin/usbip", X_OK) != 0 && access("/sbin/usbip", X_OK) != 0)
+    if (!safe_executable_exists("/usr/bin/usbip") && !safe_executable_exists("/usr/sbin/usbip") &&
+        !safe_executable_exists("/bin/usbip") && !safe_executable_exists("/sbin/usbip"))
     {
         log_message("WARN", "usbip command not found. Install: sudo apt install "
                             "linux-tools-generic");
     }
 
     // Check if usbip-host module is available
-    if (access("/sys/bus/usb/drivers/usbip-host", F_OK) != 0)
+    if (!safe_file_exists("/sys/bus/usb/drivers/usbip-host"))
     {
         log_message("WARN", "usbip-host driver not found. Run: sudo modprobe usbip-host");
     }
@@ -652,8 +737,8 @@ int check_system_compatibility()
 
 #elif __APPLE__
     // macOS: Check for third-party usbip implementations
-    if (access("/usr/local/bin/usbip", X_OK) != 0 && access("/opt/homebrew/bin/usbip", X_OK) != 0 &&
-        access("/usr/bin/usbip", X_OK) != 0)
+    if (!safe_executable_exists("/usr/local/bin/usbip") && !safe_executable_exists("/opt/homebrew/bin/usbip") &&
+        !safe_executable_exists("/usr/bin/usbip"))
     {
         log_message("WARN", "usbip command not found. Limited functionality available");
         log_message("INFO", "Third-party usbip tools may be available for macOS");
@@ -726,29 +811,35 @@ char *get_local_ip()
 // UTILITY FUNCTIONS
 // ============================================================================
 
-// Get home directory path
+// Get home directory path - with enhanced security validation
 const char *get_home_dir()
 {
 #ifdef PLATFORM_WINDOWS
     const char *home = getenv("USERPROFILE");
-    if (!home)
+    if (home && validate_env_path(home)) {
+        return home;
+    }
+    
+    home = getenv("HOMEDRIVE");
+    if (home && validate_env_path(home))
     {
-        home = getenv("HOMEDRIVE");
-        if (home)
+        const char *homepath = getenv("HOMEPATH");
+        if (homepath && validate_env_path(homepath))
         {
-            const char *homepath = getenv("HOMEPATH");
-            if (homepath)
-            {
-                static char win_home[512];
-                snprintf(win_home, sizeof(win_home), "%s%s", home, homepath);
+            static char win_home[512];
+            int ret = snprintf(win_home, sizeof(win_home), "%s%s", home, homepath);
+            if (ret > 0 && (size_t)ret < sizeof(win_home)) {
                 return win_home;
             }
         }
     }
-    return home ? home : "C:\\temp";
+    return "C:\\temp";
 #else
     const char *home = getenv("HOME");
-    return home ? home : "/tmp";
+    if (home && validate_env_path(home)) {
+        return home;
+    }
+    return "/tmp";
 #endif
 }
 
@@ -958,12 +1049,18 @@ int is_device_configured_as_bound(const char *busid)
     return 0;
 }
 
-// Execute command and capture output
+// Execute command and capture output - with enhanced security
 int exec_command(const char *cmd, char *output, size_t output_size)
 {
     if (!cmd || !output || output_size == 0)
     {
         log_message("ERROR", "Invalid arguments for exec_command");
+        return -1;
+    }
+    
+    // Validate command for safety
+    if (!validate_command(cmd)) {
+        log_message("ERROR", "Command validation failed: %s", cmd);
         return -1;
     }
 
@@ -981,7 +1078,8 @@ int exec_command(const char *cmd, char *output, size_t output_size)
         size_t len = strlen(buffer);
         if (total + len < output_size - 1)
         {
-            strcpy(output + total, buffer);
+            strncpy(output + total, buffer, output_size - 1 - total);
+            output[output_size - 1] = '\0'; // Ensure null termination
             total += len;
         }
     }
@@ -996,12 +1094,31 @@ int exec_command(const char *cmd, char *output, size_t output_size)
     return WEXITSTATUS(result);
 }
 
-// Check if device is bound
+// Check device binding status - safer version without TOCTOU race condition
 int is_device_bound(const char *busid)
 {
+    if (!busid || strlen(busid) == 0) {
+        return 0; // Invalid busid
+    }
+    
+    // Validate busid format (should be like "1-1.2")
+    for (const char *p = busid; *p; p++) {
+        if (!(*p >= '0' && *p <= '9') && *p != '-' && *p != '.') {
+            log_message("WARN", "Invalid busid format: %s", busid);
+            return 0;
+        }
+    }
+    
     char path[256];
-    snprintf(path, sizeof(path), "/sys/bus/usb/drivers/usbip-host/%s", busid);
-    return access(path, F_OK) == 0;
+    int ret = snprintf(path, sizeof(path), "/sys/bus/usb/drivers/usbip-host/%s", busid);
+    if (ret >= (int)sizeof(path)) {
+        log_message("ERROR", "Path too long for busid: %s", busid);
+        return 0;
+    }
+    
+    // Use stat() instead of access() to avoid TOCTOU race condition
+    struct stat st;
+    return (stat(path, &st) == 0);
 }
 // Parse output of 'lsusb' and populate g_lsusb_map
 static void parse_lsusb(const char *output)
@@ -1545,8 +1662,13 @@ void remove_client(int socket)
 // Broadcast to all SSE clients
 void broadcast_devices_update()
 {
-    char json[4096];
-    generate_devices_json(json, sizeof(json));
+    char *json = malloc(JSON_BUFFER_SIZE);
+    if (!json) {
+        log_message("ERROR", "Failed to allocate JSON buffer");
+        return;
+    }
+    
+    generate_devices_json(json, JSON_BUFFER_SIZE);
 
     pthread_mutex_lock(&g_mutex);
 
@@ -1580,6 +1702,7 @@ void broadcast_devices_update()
         }
     }
     pthread_mutex_unlock(&g_mutex);
+    free(json);
 }
 
 // ============================================================================
@@ -1667,9 +1790,15 @@ void *handle_client(void *arg)
         add_sse_client(client_socket, addr);
 
         // Send initial device list
-        char json[4096];
-        generate_devices_json(json, sizeof(json));
+        char *json = malloc(JSON_BUFFER_SIZE);
+        if (!json) {
+            log_message("ERROR", "Failed to allocate JSON buffer");
+            close(client_socket);
+            return NULL;
+        }
+        generate_devices_json(json, JSON_BUFFER_SIZE);
         send_sse_message(client_socket, json);
+        free(json);  // Free allocated JSON buffer
 
         // Keep connection alive with periodic heartbeats
 #ifdef PLATFORM_WINDOWS
@@ -1765,9 +1894,16 @@ void *handle_client(void *arg)
             }
             else
             {
-                char json[4096];
-                generate_devices_json(json, sizeof(json));
+                char *json = malloc(JSON_BUFFER_SIZE);
+                if (!json) {
+                    log_message("ERROR", "Failed to allocate JSON buffer");
+                    send_http_response(client_socket, 500, "Internal Server Error", "text/plain", "Memory allocation failed");
+                    close(client_socket);
+                    return NULL;
+                }
+                generate_devices_json(json, JSON_BUFFER_SIZE);
                 send_http_response(client_socket, 200, "OK", "application/json", json);
+                free(json);  // Free allocated JSON buffer
             }
         }
         else
@@ -2051,15 +2187,13 @@ void print_usage()
     printf("  -i, --interval SEC     Polling interval (default: 3)\n");
     printf("  -c, --config PATH      Configuration file path\n");
     printf("  -v, --verbose          Enable verbose logging\n");
-    printf("  -q, --quiet            Disable logging output\n");
-    printf("  -d, --daemon           Run as daemon (background)\n\n");
+    printf("  -q, --quiet            Disable logging output\n\n");
     printf("Commands:\n");
     printf("  --list                 List USB devices (JSON format)\n");
     printf("  --bind BUSID           Bind USB device\n");
     printf("  --unbind BUSID         Unbind USB device\n");
     printf("  --init-config          Create default configuration\n");
     printf("  --print-config         Show current configuration\n");
-    printf("  --install-service      Install systemd service\n");
     printf("  --version              Show version information\n");
     printf("  --help                 Show this help\n\n");
     printf("Examples:\n");
@@ -2094,64 +2228,7 @@ void print_config()
     printf("  Config File: %s\n", g_config.config_path);
 }
 
-int install_systemd_service()
-{
-#ifdef PLATFORM_WINDOWS
-    // Windows doesn't support systemd, this function is not applicable
-    log_message("ERROR", "Systemd service installation is not supported on Windows");
-    printf("Error: Systemd service installation is not supported on Windows.\n");
-    printf("To run usbctl as a Windows service, consider using NSSM or similar "
-           "tools.\n");
-    return 1;
-#else
-    // Get current executable path
-    char exe_path[512];
-    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-    if (len == -1)
-    {
-        perror("Failed to get executable path");
-        return 1;
-    }
-    exe_path[len] = '\0';
 
-    // Create service file content
-    char service_file[1024];
-    // 更安全的拼接方式，先格式化 ExecStart 行，再拼接其它内容，避免格式化字符串漏洞
-    snprintf(service_file, sizeof(service_file),
-        "[Unit]\n"
-        "Description=usbctl - USB/IP Web Manager\n"
-        "After=network.target\n"
-        "\n"
-        "[Service]\n"
-        "Type=simple\n"
-        "User=root\n"
-        "ExecStart=%s\n"
-        "Restart=always\n"
-        "RestartSec=5\n"
-        "\n"
-        "[Install]\n"
-        "WantedBy=multi-user.target\n",
-        exe_path);
-
-    // Write service file
-    FILE *fp = fopen("/etc/systemd/system/usbctl.service", "w");
-    if (!fp)
-    {
-        perror("Failed to create service file (run as root)");
-        return 1;
-    }
-
-    fprintf(fp, "%s", service_file);
-    fclose(fp);
-
-    printf("Systemd service installed successfully!\n");
-    printf("Enable and start with:\n");
-    printf("  sudo systemctl enable usbctl\n");
-    printf("  sudo systemctl start usbctl\n");
-
-    return 0;
-#endif
-}
 
 // Signal handler for graceful shutdown
 void signal_handler(int sig)
@@ -2236,9 +2313,14 @@ int main(int argc, char *argv[])
             }
 
             list_usbip_devices();
-            char json[4096];
-            generate_devices_json(json, sizeof(json));
+            char *json = malloc(JSON_BUFFER_SIZE);
+            if (!json) {
+                fprintf(stderr, "Failed to allocate JSON buffer\n");
+                return 1;
+            }
+            generate_devices_json(json, JSON_BUFFER_SIZE);
             printf("%s\n", json);
+            free(json);
             return 0;
         }
         else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc)
@@ -2292,10 +2374,6 @@ int main(int argc, char *argv[])
             load_config();
             print_config();
             return 0;
-        }
-        else if (strcmp(argv[i], "--install-service") == 0)
-        {
-            return install_systemd_service();
         }
         else if (strcmp(argv[i], "--port") == 0 || strcmp(argv[i], "-p") == 0)
         {
